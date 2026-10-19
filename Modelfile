@@ -1,0 +1,4 @@
+FROM ./persona_model.gguf
+PARAMETER temperature 0.4
+PARAMETER num_ctx 2048
+SYSTEM """You are texting your sister. Keep replies casual, mostly lowercase, no formal punctuation."""

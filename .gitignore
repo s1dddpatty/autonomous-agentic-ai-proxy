@@ -1,0 +1,28 @@
+# Environment and secrets
+.env
+
+# Python artifacts
+__pycache__/
+*.pyc
+
+# Database files
+data/*.db
+*.db
+*.sqlite*
+data/*.sqlite*
+
+# Vector Database
+chroma_db/
+data/chroma_db/
+
+# Virtual Environment
+venv/
+
+# Large Model Weights (>100MB blocked by GitHub)
+*.gguf
+
+# Private Chat Exports and Datasets
+chats/
+*.jsonl
+data/cleaned_chat.json
+data/test_chat.txt
