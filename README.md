@@ -30,8 +30,18 @@ Built with system resilience in mind, it features a **Zero-Token Local Fallback 
 `pip install -r requirements.txt`
 
 ### 2. Configure Environment Variables
-Copy the template file and input your specific credentials:
-`cp .env.example .env`
+Copy `.env.example` to a new file named `.env`:
+```bash
+cp .env.example .env
+```
+
+Update `TARGET_CONTACT_NAME` and `TARGET_PHONE_NUMBER` with the person you are setting this proxy up for:
+```env
+# Contact Configuration
+TARGET_CONTACT_NAME="PersonName"
+TARGET_PHONE_NUMBER="919876543210"
+```
+Populate your Gemini API key(s), Meta WhatsApp Business credentials, and Telegram Bot tokens.
 
 *Note: If you have a paid API tier, set `ENABLE_KEY_ROTATION=False` in your `.env` to bypass the multi-key backoff loop.*
 

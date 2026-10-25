@@ -7,9 +7,7 @@ from datetime import datetime
 from typing import List, Dict, Optional, Tuple
 import chromadb
 
-# Persistent ChromaDB storage path relative to project root
-BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
-CHROMA_PATH = os.path.join(BASE_DIR, "chroma_db")
+from src.core.config import CHROMA_PATH, DB_PATH, DATA_DIR, BASE_DIR
 
 STYLE_COLLECTION_NAME = "style_bursts"
 EPISODIC_COLLECTION_NAME = "episodic_memories"
@@ -41,6 +39,7 @@ def is_placeholder_line(line: str) -> bool:
         "you deleted this message",
         "waiting for this message. this may take a while.",
         "waiting for this message",
+        f"m rlyy sorryy {os.getenv('TARGET_CONTACT_NAME', 'PersonName').lower()}",
         "m rlyy sorryy aarushii",
         "ill be back in ",
         "m superr tired...i am going to rest now",
@@ -172,7 +171,7 @@ def get_chroma_client() -> chromadb.PersistentClient:
 
 def get_style_bursts_collection():
     """
-    Collection storing Aarushi Trigger bursts as vectors, with Siddharth Response bursts in metadata.
+    Collection storing Target Contact Trigger bursts as vectors, with Operator Response bursts in metadata.
     """
     client = get_chroma_client()
     return client.get_or_create_collection(
@@ -182,7 +181,7 @@ def get_style_bursts_collection():
 
 def get_episodic_memories_collection():
     """
-    Collection storing full exchanges (Aarushi Trigger + Siddharth Response) for deep context recall.
+    Collection storing full exchanges (Target Contact Trigger + Operator Response) for deep context recall.
     """
     client = get_chroma_client()
     return client.get_or_create_collection(
@@ -192,7 +191,7 @@ def get_episodic_memories_collection():
 
 def get_fact_memory_collection():
     """
-    Collection storing permanent facts, relationship details, and personal attributes about Aarushi/Siddharth.
+    Collection storing permanent facts, relationship details, and personal attributes.
     """
     client = get_chroma_client()
     return client.get_or_create_collection(
@@ -259,8 +258,8 @@ def _group_bubbles_into_bursts(messages: List[Dict[str, str]]) -> List[Dict[str,
 
 def extract_burst_pairs_from_jsonl(filepath: str) -> List[Dict]:
     """
-    Parses a JSONL file, filters WhatsApp artifacts, and pairs every Aarushi Burst (Trigger)
-    with the immediately following Siddharth Burst (Response).
+    Parses a JSONL file, filters WhatsApp artifacts, and pairs every Target Contact Burst (Trigger)
+    with the immediately following Response Burst.
     """
     pairs = []
     if not os.path.exists(filepath):
@@ -277,16 +276,17 @@ def extract_burst_pairs_from_jsonl(filepath: str) -> List[Dict]:
                 continue
 
             convs = [m for m in data.get("conversations", []) if m.get("from") != "system"]
+            target_name = os.getenv("TARGET_CONTACT_NAME", "PersonName")
             raw_messages = []
             for m in convs:
-                role = "Aarushi" if m.get("from") == "human" else "Siddharth"
+                role = target_name if m.get("from") == "human" else "Siddharth"
                 val = clean_burst_text(m.get("value", ""))
                 if val:
                     raw_messages.append({"role": role, "text": val})
 
             bursts = _group_bubbles_into_bursts(raw_messages)
             for i in range(len(bursts) - 1):
-                if bursts[i]["role"] == "Aarushi" and bursts[i + 1]["role"] == "Siddharth":
+                if bursts[i]["role"] in [target_name, "Aarushi", "human"] and bursts[i + 1]["role"] == "Siddharth":
                     a_text = clean_burst_text(bursts[i]["text"])
                     s_text = clean_burst_text(bursts[i + 1]["text"])
                     # Skip pairs where either trigger or response was only placeholder/empty
@@ -306,7 +306,7 @@ def extract_burst_pairs_from_jsonl(filepath: str) -> List[Dict]:
 def extract_burst_pairs_from_db(db_path: str) -> List[Dict]:
     """
     Reads SQLite messages table, filters WhatsApp artifacts, groups consecutive speaker
-    messages into bursts, and pairs Aarushi Trigger -> Siddharth Response.
+    messages into bursts, and pairs Target Contact Trigger -> Response.
     """
     pairs = []
     if not os.path.exists(db_path):
@@ -318,10 +318,11 @@ def extract_burst_pairs_from_db(db_path: str) -> List[Dict]:
     rows = cursor.fetchall()
     conn.close()
 
+    target_name = os.getenv("TARGET_CONTACT_NAME", "PersonName")
     raw_messages = []
     for row in rows:
         db_id, role, content, ts = row
-        role_standard = "Siddharth" if role in ["Siddharth", "ai", "model", "gpt"] else "Aarushi"
+        role_standard = "Siddharth" if role in ["Siddharth", "ai", "model", "gpt"] else target_name
         content_clean = clean_burst_text(content or "")
         if content_clean:
             raw_messages.append({"role": role_standard, "text": content_clean, "ts": str(ts)})
@@ -329,7 +330,7 @@ def extract_burst_pairs_from_db(db_path: str) -> List[Dict]:
     bursts = _group_bubbles_into_bursts(raw_messages)
 
     for i in range(len(bursts) - 1):
-        if bursts[i]["role"] == "Aarushi" and bursts[i + 1]["role"] == "Siddharth":
+        if bursts[i]["role"] in [target_name, "Aarushi", "human"] and bursts[i + 1]["role"] == "Siddharth":
             a_text = clean_burst_text(bursts[i]["text"])
             s_text = clean_burst_text(bursts[i + 1]["text"])
             if not a_text or not s_text:
@@ -363,15 +364,16 @@ def extract_burst_pairs_from_chats_dir(chats_dir: str) -> List[Dict]:
                     with open(filepath, "r", encoding="utf-8") as f:
                         data = json.load(f)
                     if isinstance(data, list):
+                        target_name = os.getenv("TARGET_CONTACT_NAME", "PersonName")
                         raw_messages = []
                         for m in data:
-                            role = "Siddharth" if m.get("role") in ["Siddharth", "gpt", "model"] else "Aarushi"
+                            role = "Siddharth" if m.get("role") in ["Siddharth", "gpt", "model"] else target_name
                             text = clean_burst_text(m.get("content") or m.get("text") or "")
                             if text:
                                 raw_messages.append({"role": role, "text": text})
                         bursts = _group_bubbles_into_bursts(raw_messages)
                         for i in range(len(bursts) - 1):
-                            if bursts[i]["role"] == "Aarushi" and bursts[i + 1]["role"] == "Siddharth":
+                            if bursts[i]["role"] in [target_name, "Aarushi", "human"] and bursts[i + 1]["role"] == "Siddharth":
                                 a_text = clean_burst_text(bursts[i]["text"])
                                 s_text = clean_burst_text(bursts[i + 1]["text"])
                                 if not a_text or not s_text:
@@ -391,10 +393,10 @@ def extract_burst_pairs_from_chats_dir(chats_dir: str) -> List[Dict]:
 
 def index_chats_to_chroma(batch_size: int = 200, clear_existing: bool = True) -> dict:
     """
-    Groups all messages from dataset.jsonl, data/chats.db, and chats/ into 100% clean
-    Aarushi Trigger -> Siddharth Response bursts (with media placeholders stripped),
+    Groups all messages from dataset.jsonl, data/chats.db, and chats/ into clean
+    Target Contact Trigger -> Response bursts (with media placeholders stripped),
     and indexes them into:
-    1. style_bursts (Trigger vector -> Siddharth Response metadata)
+    1. style_bursts (Trigger vector -> Response metadata)
     2. episodic_memories (Full exchange vector -> topic/fact recall)
     """
     client = get_chroma_client()
@@ -426,7 +428,7 @@ def index_chats_to_chroma(batch_size: int = 200, clear_existing: bool = True) ->
             all_pairs[p["hash"]] = p
 
     # 2. SQLite chats.db
-    db_path = os.path.join(BASE_DIR, "data/chats.db")
+    db_path = DB_PATH
     if os.path.exists(db_path):
         for p in extract_burst_pairs_from_db(db_path):
             if p["hash"] not in all_pairs:
@@ -440,7 +442,7 @@ def index_chats_to_chroma(batch_size: int = 200, clear_existing: bool = True) ->
                 all_pairs[p["hash"]] = p
 
     total_unique_pairs = len(all_pairs)
-    print(f"[Vector Memory] Found {total_unique_pairs} pure-text Aarushi->Siddharth burst pairs across sources.")
+    print(f"[Vector Memory] Found {total_unique_pairs} pure-text burst pairs across sources.")
 
     # Prepare batches for style_bursts and episodic_memories
     style_docs, style_ids, style_metas = [], [], []
@@ -455,7 +457,7 @@ def index_chats_to_chroma(batch_size: int = 200, clear_existing: bool = True) ->
         source_id = p["source"]
         timestamp_str = p.get("timestamp", "")
 
-        # Classify vibe of Aarushi's trigger
+        # Classify vibe of trigger burst
         vibe = classify_message_vibe(a_burst)
         detected_mood = vibe["mood"]
         detected_stage = vibe["conv_stage"]
@@ -477,7 +479,8 @@ def index_chats_to_chroma(batch_size: int = 200, clear_existing: bool = True) ->
         if episodic_id in existing_episodic_ids:
             skipped_episodic += 1
         else:
-            episodic_docs.append(f"Aarushi: {a_burst}\nSiddharth: {s_burst}")
+            target_name = os.getenv("TARGET_CONTACT_NAME", "PersonName")
+            episodic_docs.append(f"{target_name}: {a_burst}\nSiddharth: {s_burst}")
             episodic_ids.append(episodic_id)
             episodic_metas.append({
                 "mood": detected_mood,
@@ -596,11 +599,12 @@ def retrieve_dual_context(
         # Sort by (tier ASC, distance ASC)
         candidates.sort(key=lambda c: (c["tier"], c["distance"]))
 
+        target_name = os.getenv("TARGET_CONTACT_NAME", "PersonName")
         selected_style = candidates[:n_style]
         for idx, item in enumerate(selected_style, 1):
             chunk = (
                 f"[Style Match #{idx} | Stage: {item['stage']} | Mood: {item['mood']}]\n"
-                f"When Aarushi said: \"{item['aarushi_burst']}\"\n"
+                f"When {target_name} said: \"{item['aarushi_burst']}\"\n"
                 f"Siddharth replied:\n{item['siddharth_reply']}"
             )
             style_chunks_list.append(chunk)

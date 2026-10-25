@@ -20,14 +20,13 @@ FACT_EXTRACTOR_SYSTEM_PROMPT = (
 
 def get_recent_chat_transcript(limit: int = 20) -> str:
     """
-    Connects to data/chats.db and fetches the last 15-20 messages in chronological order.
+    Connects to chats.db and fetches the last 15-20 messages in chronological order.
     """
-    base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
-    db_path = os.path.join(base_dir, "data/chats.db")
-    if not os.path.exists(db_path):
+    from src.core.config import DB_PATH
+    if not os.path.exists(DB_PATH):
         return ""
     
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT role, content FROM messages ORDER BY id DESC LIMIT ?", (limit,))
     rows = cursor.fetchall()

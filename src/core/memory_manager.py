@@ -2,11 +2,10 @@ import sqlite3
 import json
 import os
 from datetime import datetime
-
-DB_PATH = "data/chats.db"
+from src.core.config import DB_PATH, DATA_DIR
 
 def setup_db():
-    os.makedirs("data", exist_ok=True)
+    os.makedirs(DATA_DIR, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('''
@@ -56,12 +55,28 @@ def setup_db():
             value TEXT
         )
     ''')
-    cursor.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('mode', 'training')")
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS pending_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id TEXT NOT NULL,
+            text TEXT NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_pending_messages_chat ON pending_messages(chat_id)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_pending_cards_thread ON pending_cards(thread_id)')
     conn.commit()
     conn.close()
 
-from src.core.database import get_config, set_config, init_db
+from src.core.database import (
+    get_config,
+    set_config,
+    init_db,
+    add_pending_message,
+    pop_pending_messages,
+    get_pending_messages,
+    clear_pending_messages,
+)
 
 def save_message(role: str, content: str):
     conn = sqlite3.connect(DB_PATH)
@@ -123,7 +138,13 @@ def get_recent_feedback(limit: int = 5) -> list[dict]:
     for row in rows:
         orig, fb, rev = row[0] or "", row[1] or "", row[2] or ""
         lower_orig, lower_rev = orig.lower(), rev.lower()
-        if "sorryy aarushii" in lower_orig or "sorryy aarushii" in lower_rev:
+        target_lower = os.getenv("TARGET_CONTACT_NAME", "PersonName").lower()
+        if (
+            f"sorryy {target_lower}" in lower_orig
+            or "sorryy aarushii" in lower_orig
+            or f"sorryy {target_lower}" in lower_rev
+            or "sorryy aarushii" in lower_rev
+        ):
             continue
         if "ill be back in" in lower_orig or "ill be back in" in lower_rev:
             continue
@@ -184,7 +205,8 @@ def ingest_chat_file(filepath: str):
                 data = json.loads(line)
                 if "conversations" in data:
                     for msg in data["conversations"]:
-                        role_map = {"human": "Aarushi", "gpt": "Siddharth", "system": "System"}
+                        target_name = os.getenv("TARGET_CONTACT_NAME", "PersonName")
+                        role_map = {"human": target_name, "gpt": "Siddharth", "system": "System"}
                         role = role_map.get(msg.get("from"), msg.get("from"))
                         content = msg.get("value", "")
                         if role != "System" and content:

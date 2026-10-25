@@ -12,31 +12,59 @@ load_dotenv()
 from google import genai
 from google.genai import types
 
-from src.core.config import GEMINI_KEYS, ENABLE_KEY_ROTATION
+from src.core.config import GEMINI_KEYS, ENABLE_KEY_ROTATION, TARGET_NAME, TARGET_PHONE
+GEMINI_API_KEYS = GEMINI_KEYS
 from src.core.memory_manager import get_recent_feedback, get_recent_history
 from src.core.vector_memory import retrieve_dual_context, retrieve_relevant_facts
+from src.core.metrics import log_api_usage
 
 def extract_clean_text(response) -> str:
     """
     Extracts text from candidate parts, explicitly ignoring thought parts.
+    Safely handles empty responses, NoneType candidate parts, and safety filter blocks.
     """
-    if not response or not hasattr(response, "candidates") or not response.candidates:
-        return (getattr(response, "text", "") or "").strip()
+    if not response:
+        return "Error: Model returned empty response (Safety filter or NoneType)."
+        
+    if not hasattr(response, "candidates") or not response.candidates:
+        try:
+            fallback = (getattr(response, "text", "") or "").strip()
+            if fallback:
+                return fallback
+        except Exception:
+            pass
+        return "Error: Model returned empty response (Safety filter or NoneType)."
     
     parts_text = []
     candidate = response.candidates[0]
-    if hasattr(candidate, "content") and candidate.content and hasattr(candidate.content, "parts"):
-        for part in candidate.content.parts:
-            # Explicitly exclude reasoning/thought parts
-            if getattr(part, "thought", False):
-                continue
-            text = getattr(part, "text", "")
-            if text:
-                parts_text.append(text)
+    if not candidate:
+        return "Error: Model returned empty response (Safety filter or NoneType)."
+        
+    content = getattr(candidate, "content", None)
+    if content:
+        parts = getattr(content, "parts", None)
+        if parts is not None:
+            for part in parts:
+                if not part:
+                    continue
+                # Explicitly exclude reasoning/thought parts
+                if getattr(part, "thought", False):
+                    continue
+                text = getattr(part, "text", "")
+                if text:
+                    parts_text.append(text)
                 
     if parts_text:
         return "".join(parts_text).strip()
-    return (getattr(response, "text", "") or "").strip()
+        
+    try:
+        fallback = (getattr(response, "text", "") or "").strip()
+        if fallback:
+            return fallback
+    except Exception:
+        pass
+        
+    return "Error: Model returned empty response (Safety filter or NoneType)."
 
 def sanitize_draft(raw_text: str) -> str:
     """
@@ -46,6 +74,9 @@ def sanitize_draft(raw_text: str) -> str:
     """
     if not raw_text:
         return ""
+        
+    if raw_text.startswith("Error:") or raw_text.startswith("⚠️"):
+        return raw_text
     
     # 1. Remove <think>...</think> blocks
     text = re.sub(r'<think>.*?</think>', '', raw_text, flags=re.DOTALL)
@@ -122,16 +153,67 @@ def get_api_reset_time_str(error_msg: str = "") -> str:
 
 def build_quota_exhausted_draft(error_msg: str = "") -> str:
     reset_time = get_api_reset_time_str(error_msg)
+    target_lower = os.getenv("TARGET_CONTACT_NAME", "PersonName").lower()
     return (
-        "heyyy...m rlyy sorryy aarushii...\n"
+        f"heyyy...m rlyy sorryy {target_lower}...\n"
         "m superr tired...i am going to rest now...\n"
         f"ill be back in {reset_time}.....\n"
         "chaloo ill go now...buhbyeee...\n"
         "muahh i love youuu ❤️💖🫶🏻💕"
     )
 
-MODEL_NAME = "gemini-flash-latest"
+# Model initialization strictly reads:
+# google.generativeai.GenerativeModel("gemini-1.5-flash-8b")
+MODEL_NAME = "gemini-1.5-flash-8b"
+ACTIVE_FALLBACK_MODEL = "gemini-flash-lite-latest"
+REQUEST_TIMEOUT_SECONDS = 8.0
 _active_key_index = 0
+
+def _create_genai_client(api_key: str):
+    try:
+        return genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(timeout=10000)
+        )
+    except TypeError:
+        return genai.Client(api_key=api_key)
+
+def _call_model_with_timeout(client, model: str, contents, config=None, request_options=None):
+    """
+    Enforces aggressive 8-second fail-fast timeout and model fallback if 1.5-8b is retired.
+    # response = await model.generate_content_async(
+    #     contents=prompt,
+    #     request_options={"timeout": 8.0}
+    # )
+    """
+    timeout = REQUEST_TIMEOUT_SECONDS
+    if request_options and "timeout" in request_options:
+        timeout = float(request_options["timeout"])
+
+    if hasattr(client, "_api_client") and hasattr(client._api_client, "_httpx_client"):
+        try:
+            import httpx
+            client._api_client._httpx_client.timeout = httpx.Timeout(timeout)
+        except Exception:
+            pass
+
+    try:
+        return client.models.generate_content(
+            model=model,
+            contents=contents,
+            config=config
+        )
+    except Exception as e:
+        # If gemini-1.5-flash-8b is not found / retired on current API version,
+        # seamlessly fallback to its active successor gemini-flash-lite-latest
+        if "404" in str(e) and "not found" in str(e).lower() and model == "gemini-1.5-flash-8b":
+            print(f"[Gemini Node] Model '{model}' not found. Falling back to active lightweight tier '{ACTIVE_FALLBACK_MODEL}'...")
+            return client.models.generate_content(
+                model=ACTIVE_FALLBACK_MODEL,
+                contents=contents,
+                config=config
+            )
+        raise
 
 def is_quota_error(e: Exception) -> bool:
     err_lower = str(e).lower()
@@ -150,7 +232,13 @@ def is_quota_fallback_text(text: str) -> bool:
     if not text:
         return False
     t_lower = text.lower()
-    return "m rlyy sorryy aarushii" in t_lower or "m superr tired...i am going to rest now" in t_lower or "ill be back in " in t_lower
+    target_lower = os.getenv("TARGET_CONTACT_NAME", "PersonName").lower()
+    return (
+        f"sorryy {target_lower}" in t_lower
+        or "sorryy aarushii" in t_lower
+        or "m superr tired...i am going to rest now" in t_lower
+        or "ill be back in " in t_lower
+    )
 
 def generate_with_key_rotation(contents, config=None) -> str:
     """
@@ -168,21 +256,41 @@ def generate_with_key_rotation(contents, config=None) -> str:
     # Single-key / Rotation disabled bypass: no sleep backoffs, execute directly
     if not ENABLE_KEY_ROTATION or total_keys == 1:
         single_key = GEMINI_KEYS[0]
+        start_time = time.time()
         try:
-            client = genai.Client(
-                api_key=single_key,
-                http_options=types.HttpOptions(timeout=25000)
-            )
-            response = client.models.generate_content(
+            client = _create_genai_client(single_key)
+            response = _call_model_with_timeout(
+                client=client,
                 model=MODEL_NAME,
                 contents=contents,
-                config=config
+                config=config,
+                request_options={"timeout": 8.0}
+            )
+            latency_ms = (time.time() - start_time) * 1000
+            prompt_tokens = 0
+            completion_tokens = 0
+            if hasattr(response, "usage_metadata") and response.usage_metadata:
+                prompt_tokens = getattr(response.usage_metadata, "prompt_token_count", 0) or 0
+                completion_tokens = getattr(response.usage_metadata, "candidates_token_count", 0) or 0
+            log_api_usage(
+                key_index=0,
+                latency_ms=latency_ms,
+                status="SUCCESS",
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens
             )
             raw_draft = extract_clean_text(response)
             draft = sanitize_draft(raw_draft)
             print(f"[Gemini Node] Successfully generated draft with {MODEL_NAME}: '{draft[:60]}...'")
             return draft
         except Exception as e:
+            latency_ms = (time.time() - start_time) * 1000
+            log_api_usage(
+                key_index=0,
+                latency_ms=latency_ms,
+                status="FAILED",
+                error=f"{type(e).__name__}: {str(e)[:100]}"
+            )
             print(f"[Gemini Node] Single key execution failed without rotation ({type(e).__name__}: {e})")
             if is_quota_error(e):
                 return build_quota_exhausted_draft(str(e))
@@ -190,7 +298,7 @@ def generate_with_key_rotation(contents, config=None) -> str:
 
     # Multi-key rotation with progressive backoffs
     last_error = None
-    backoff_delays = [2.0, 3.0, 4.0, 6.0, 8.0]
+    backoff_delays = [2.0, 4.0, 6.0, 8.0]
     transient_retry_count = 0
     quota_exhausted_keys = set()
     max_attempts = total_keys + len(backoff_delays)
@@ -200,21 +308,41 @@ def generate_with_key_rotation(contents, config=None) -> str:
         current_key = GEMINI_KEYS[idx]
         next_idx = (idx + 1) % total_keys
 
+        start_time = time.time()
         try:
-            client = genai.Client(
-                api_key=current_key,
-                http_options=types.HttpOptions(timeout=25000)
-            )
-            response = client.models.generate_content(
+            client = _create_genai_client(current_key)
+            response = _call_model_with_timeout(
+                client=client,
                 model=MODEL_NAME,
                 contents=contents,
-                config=config
+                config=config,
+                request_options={"timeout": 8.0}
+            )
+            latency_ms = (time.time() - start_time) * 1000
+            prompt_tokens = 0
+            completion_tokens = 0
+            if hasattr(response, "usage_metadata") and response.usage_metadata:
+                prompt_tokens = getattr(response.usage_metadata, "prompt_token_count", 0) or 0
+                completion_tokens = getattr(response.usage_metadata, "candidates_token_count", 0) or 0
+            log_api_usage(
+                key_index=idx,
+                latency_ms=latency_ms,
+                status="SUCCESS",
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens
             )
             raw_draft = extract_clean_text(response)
             draft = sanitize_draft(raw_draft)
             print(f"[Gemini Node] Successfully generated draft using Key #{idx + 1} with {MODEL_NAME}: '{draft[:60]}...'")
             return draft
         except Exception as e:
+            latency_ms = (time.time() - start_time) * 1000
+            log_api_usage(
+                key_index=idx,
+                latency_ms=latency_ms,
+                status="FAILED",
+                error=f"{type(e).__name__}: {str(e)[:100]}"
+            )
             last_error = e
             if is_quota_error(e):
                 quota_exhausted_keys.add(idx)
@@ -254,7 +382,14 @@ def load_guardrails() -> str:
         return ""
     try:
         with open(GUARDRAILS_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
+            raw_content = f.read()
+        target_name = os.getenv("TARGET_CONTACT_NAME", "PersonName")
+        raw_content = (
+            raw_content.replace("{TARGET_CONTACT_NAME}", target_name)
+            .replace("{TARGET_NAME}", target_name)
+            .replace("Aarushi", target_name)
+        )
+        data = json.loads(raw_content)
         parts = []
         if "core_facts" in data:
             facts = "\n".join(f"- {fact}" for fact in data["core_facts"])
@@ -310,6 +445,8 @@ def gemini_proxy_node(state: dict) -> dict:
             )
         learned_corrections_str = "\n<LEARNED_STYLE_CORRECTIONS>\n" + "\n\n".join(corrections) + "\n</LEARNED_STYLE_CORRECTIONS>\n"
 
+    target_name = os.getenv("TARGET_CONTACT_NAME", "PersonName")
+
     # 5. Extract input and history from State & SQLite
     messages_history = state.get("messages", [])
     if not messages_history:
@@ -317,8 +454,7 @@ def gemini_proxy_node(state: dict) -> dict:
         
     history_lines = []
     for msg in messages_history:
-        # BUG FIX 1: Ensure "Siddharth" is recognized so his messages aren't mislabeled as Aarushi
-        role_name = "Siddharth" if msg.get("role") in ["Siddharth", "ai", "model", "gpt"] else "Aarushi"
+        role_name = "Siddharth" if msg.get("role") in ["Siddharth", "ai", "model", "gpt"] else target_name
         content = msg.get("content", "").strip()
         if content:
             history_lines.append(f"{role_name}: {content}")
@@ -327,7 +463,7 @@ def gemini_proxy_node(state: dict) -> dict:
     
     # 6. Build Mega-Prompt with 4-Step Brain Architecture
     system_instruction = f"""You are Siddharth, a 21-year-old B.Tech student at SPIT in Mumbai. 
-You are texting your girlfriend Aarushi on WhatsApp.
+You are texting your girlfriend {target_name} on WhatsApp.
 
 [CURRENT DATE & TIME]: {current_time_str}
 [DETECTED VIBE]: Conversation Stage = "{detected_stage.upper()}", Mood = "{detected_mood.upper()}"
@@ -338,9 +474,9 @@ You are texting your girlfriend Aarushi on WhatsApp.
 Step 1 (Stage & Intent Check):
 - Current detected stage: "{detected_stage}"
 - Inspect the detected conversation stage and recent chat history.
-- CRITICAL: If Aarushi is opening a conversation (e.g., "heyy", "wassup", "morning") or asking a question, NEVER end the conversation or say goodnight—greet her back warmly and talk or answer directly based on [CURRENT DATE & TIME], even if it is late at night.
+- CRITICAL: If {target_name} is opening a conversation (e.g., "heyy", "wassup", "morning") or asking a question, NEVER end the conversation or say goodnight—greet her back warmly and talk or answer directly based on [CURRENT DATE & TIME], even if it is late at night.
 - ONLY initiate closing/goodnight sequences if she is explicitly closing the conversation (e.g., saying goodnight, sleeping, bye).
-- SENTENCE-BY-SENTENCE & MULTI-POINT COVERAGE: When Aarushi sends multiple lines or distinct statements in a burst (e.g., 1. feeling tired, 2. crowd at market, 3. bought a normal dress, 4. asking what you are doing), DO NOT just reply to the final question. You MUST reply to EVERY SINGLE statement in order across your response bubbles—react to what she shared/bought, acknowledge how she feels, and answer her questions naturally without skipping middle lines.
+- MULTI-POINT CONTEXT AWARENESS: When {target_name} sends multiple lines or distinct statements in a burst, do not ignore earlier statements just to answer the last line. Acknowledge her thoughts naturally, but do not feel obligated to mirror her exact message count.
 
 Step 2 (Mood & Tone Calibration):
 - Current detected mood: "{detected_mood}"
@@ -351,12 +487,19 @@ Step 2 (Mood & Tone Calibration):
   * "serious_upset": drop all sarcasm, jokes, and shorthand; provide genuine reassurance, attentiveness, and mature comfort
   * "casual": relaxed, chill, everyday conversational Hinglish ("ha", "thik", "wbu", "nw")
 
-Step 3 (Top-10 Pattern Synthesis vs. Copy-Pasting):
+Step 3 (Top-10 Pattern Synthesis vs. Copy-Pasting & Message Segmentation):
 - Study <TOP_10_SITUATIONAL_STYLE_BURSTS> below.
 - Do NOT blindly copy-paste outdated facts, past events, or specific random plans from these bursts.
 - Instead, synthesize Siddharth's exact texting style: short multi-line burst structure (multiple rapid bubbles joined by newlines), shorthand words ("heyyy", "Wbu", "nw", "m", "idk", "btw"), lack of formal punctuation, and typing cadence.
-- SENTENCE-BY-SENTENCE & MULTI-POINT COVERAGE: When Aarushi sends multiple lines or distinct statements in a burst (e.g., 1. feeling tired, 2. crowd at market, 3. bought a normal dress, 4. asking what you are doing), DO NOT just reply to the final question. You MUST reply to EVERY SINGLE statement in order across your response bubbles—react to what she shared/bought, acknowledge how she feels, and answer her questions naturally without skipping middle lines.
 - EXCEPTION: If the situational style bursts or <CUSTOM_GUARDRAILS> demonstrate a consistent signature ritual (such as the sacred multi-line goodnight sequence when she says goodnight), output that full signature sequence.
+
+CRITICAL FORMATTING INSTRUCTION:
+When responding to a multi-line burst from {target_name}, DO NOT automatically reply with the exact same number of lines. You are not a mirror.
+- Evaluate the context and mood.
+- You can reply with a single, concise sentence that addresses everything.
+- You can reply with two short texts.
+- Do NOT feel obligated to match her message count. Often, a single well-crafted text is more natural than firing back 4 separate texts just because she sent 4.
+- If she sends a wall of text, you can respond with just one short line. Prioritize natural, flowing conversation over strict 1:1 line matching.
 
 Step 4 (Deep Memory & Feedback Override):
 - Use <RECALLED_EPISODIC_MEMORIES> only when relevant to specific past events or facts she references.
@@ -364,13 +507,13 @@ Step 4 (Deep Memory & Feedback Override):
 
 FEW-SHOT TEXTING EXAMPLES:
 Example 1 (Casual opener):
-Aarushi: heyyy
+{target_name}: heyyy
 Siddharth:
 Heyyy
 Kaisi hai?
 
 Example 2 (Closing / Goodnight):
-Aarushi: okay goodnightt
+{target_name}: okay goodnightt
 Siddharth:
 Goodnight
 Sweet dreams 😴 ✨️ 💖
@@ -380,22 +523,19 @@ Take care
 Sleep well n dream well 😴 💖 💓
 Buhbyeee🫶✨💖
 
-Example 3 (Multi-line burst — replying to every point in order):
-Aarushi:
+Example 3 (Multi-line burst — natural dynamic response):
+{target_name}:
 bohot thak gayi yaar
 itna bheed tha waha
 normal dress n all liya
 tu kya kar raha hai abhi?
 Siddharth:
-Aree baith ja aaram se paani pi le pehle
-Sunday ko gayi thi toh bheed hi milega na 😂
-Itne dhakke khaake 'normal dress' liya? Wah
-Pic bhej dekhu kaisa he
-Mai kuch nhi bas bed pe pada hu phone scroll kar rha tha
+Aree Sunday ko itne dhakke khaake 'normal dress' liya? 😂
+Paani pi le aaram se, mai bas bed pe pada hu
 
 YOUR GENERAL PERSONA:
 - MFA 3rd Div football player, Python/ML coder at SPIT Mumbai.
-- Warm, affectionate, chill human boyfriend texting his girlfriend.
+- Warm, affectionate, chill human boyfriend texting his girlfriend {target_name}.
 - NEVER output placeholder tags like <image omitted> or <Media omitted>. You are texting in real time; output only real text and emojis.
 - Output ONLY your raw text message reply (multi-line bursts separated by newlines are natural). Do not include quotes, JSON, or speaker prefixes.
 CRITICAL OUTPUT RULE: Never output your internal checklist, bullet points (* or -), '/think' tags, or meta-commentary like 'Vibe is casual' or 'Stage is ongoing'. Do all reasoning silently. Output ONLY the raw Hinglish chat lines that Siddharth sends on WhatsApp.
@@ -421,7 +561,7 @@ Recent Chat History (Last 20 messages):
 {history_str}
 
 Current Trigger:
-Aarushi: {incoming_text}
+{target_name}: {incoming_text}
 Siddharth:"""
 
     # Set max_output_tokens=4096 so thinking_level='high' has ample token budget for full multi-line rituals

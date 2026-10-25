@@ -5,6 +5,20 @@ from dotenv import load_dotenv
 # Call load_dotenv() at the top of the file
 load_dotenv()
 
+# --- PERSISTENT VOLUME & STORAGE PATHS ---
+# Base project directory
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+
+# Cloud servers will inject DATA_DIR (e.g., /mnt/data). Locally, it defaults to the relative "data" folder.
+DATA_DIR = os.getenv("DATA_DIR", os.path.join(BASE_DIR, "data"))
+os.makedirs(DATA_DIR, exist_ok=True)
+
+# Update subsequent paths to use this base:
+DB_PATH = os.path.join(DATA_DIR, "chats.db")
+METRICS_PATH = os.path.join(DATA_DIR, "api_analytics.jsonl")
+CHROMA_PATH = os.getenv("CHROMA_PATH", os.path.join(DATA_DIR, "chroma_db"))
+CHECKPOINT_DB_PATH = os.path.join(DATA_DIR, "checkpoint.sqlite")
+
 # --- GEMINI CONFIGURATION ---
 def _load_gemini_keys() -> List[str]:
     keys = []
@@ -45,6 +59,12 @@ GEMINI_KEYS: List[str] = _load_gemini_keys()
 # ENABLE_KEY_ROTATION (boolean flag, default to True)
 ENABLE_KEY_ROTATION: bool = os.getenv("ENABLE_KEY_ROTATION", "True").strip().lower() in ("true", "1", "yes")
 
+# --- CONTACT CONFIGURATION ---
+TARGET_CONTACT_NAME: str = (
+    os.getenv("TARGET_CONTACT_NAME") or "PersonName"
+).strip().strip("'\"")
+TARGET_NAME: str = TARGET_CONTACT_NAME
+
 # --- WHATSAPP CONFIGURATION ---
 WHATSAPP_ACCESS_TOKEN: str = (
     os.getenv("WHATSAPP_ACCESS_TOKEN") or os.getenv("WHATSAPP_TOKEN") or ""
@@ -57,6 +77,7 @@ WHATSAPP_PHONE_ID: str = (
 TARGET_PHONE_NUMBER: str = (
     os.getenv("TARGET_PHONE_NUMBER") or os.getenv("RECIPIENT_PHONE_NUMBER") or ""
 ).strip().strip("'\"")
+TARGET_PHONE: str = TARGET_PHONE_NUMBER
 
 # --- TELEGRAM CONFIGURATION ---
 TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "").strip().strip("'\"")

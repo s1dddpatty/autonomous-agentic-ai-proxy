@@ -21,7 +21,9 @@ from src.core.memory_manager import (
     save_pending_card,
 )
 
-from src.core.config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+from src.core.config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TARGET_NAME, TARGET_PHONE
+
+TARGET_NAME = os.getenv("TARGET_CONTACT_NAME", TARGET_NAME or "PersonName")
 
 TOKEN = TELEGRAM_BOT_TOKEN
 AUTHORIZED_USER_ID = int(TELEGRAM_CHAT_ID) if TELEGRAM_CHAT_ID else 0
@@ -78,7 +80,7 @@ def create_card(incoming_text: str, draft_text: str, thread_id: str, is_fallback
             
         text = (
             f"{header}\n\n"
-            f"From: Aarushi\n"
+            f"From: {TARGET_NAME}\n"
             f"Text:\n\"{incoming_text}\"\n\n"
             "🤖 Proposed AI Draft:\n"
             f"\"{draft_text}\""
@@ -91,7 +93,7 @@ async def simulate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
         
     thread_id = str(uuid.uuid4())[:8]
-    sender_id = "Aarushi"
+    sender_id = TARGET_NAME
     incoming_text = "how is your day going? milo just knocked over another plant 😭"
     
     await update.message.reply_text(f"Starting simulation. Thread ID: {thread_id}")
@@ -152,7 +154,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if m:
                 current_draft = m.group(1)
 
-        err_type = 429 if ("m rlyy sorryy aarushii" in current_draft or "rest now" in current_draft or "13 hours" in current_draft) else 503
+        target_lower = TARGET_NAME.lower()
+        err_type = 429 if (f"sorryy {target_lower}" in current_draft or "sorryy aarushii" in current_draft or "rest now" in current_draft or "13 hours" in current_draft) else 503
         new_draft = get_random_fallback(error_type=err_type, exclude=current_draft)
         effective_thread = card.get("thread_id", target_id) if card else target_id
         

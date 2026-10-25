@@ -1,3 +1,4 @@
+import os
 import random
 from typing import Optional, List
 
@@ -8,14 +9,18 @@ OFFLINE_STALL_DRAFTS: List[str] = [
     "Arre mom ne kuch kaam bol diya tha achanak, 5 min de free hoke proper text karta hu"
 ]
 
+def get_quota_exhausted_drafts() -> List[str]:
+    target_lower = os.getenv("TARGET_CONTACT_NAME", "PersonName").lower()
+    return [
+        f"heyyy...m rlyy sorryy {target_lower}...\n"
+        "m superr tired...i am going to rest now...\n"
+        "ill be back in 13 hours.....\n"
+        "chaloo ill go now...buhbyeee...\n"
+        "muahh i love youuu ❤️💖🫶💕"
+    ]
+
 # Long-term 429 Quota Exhausted drafts (using newlines to simulate multiple bubbles)
-QUOTA_EXHAUSTED_DRAFTS: List[str] = [
-    "heyyy...m rlyy sorryy aarushii...\n"
-    "m superr tired...i am going to rest now...\n"
-    "ill be back in 13 hours.....\n"
-    "chaloo ill go now...buhbyeee...\n"
-    "muahh i love youuu ❤️💖🫶💕"
-]
+QUOTA_EXHAUSTED_DRAFTS: List[str] = get_quota_exhausted_drafts()
 
 def get_random_fallback(error_type: int = 503, exclude: Optional[str] = None) -> str:
     """
@@ -29,10 +34,10 @@ def get_random_fallback(error_type: int = 503, exclude: Optional[str] = None) ->
         exclude = error_type
         error_type = 503
 
-    target_pool = QUOTA_EXHAUSTED_DRAFTS if error_type == 429 else OFFLINE_STALL_DRAFTS
-    choices = [d for d in target_pool if d != exclude] if exclude else target_pool
+    pool = get_quota_exhausted_drafts() if error_type == 429 else OFFLINE_STALL_DRAFTS
+    choices = [d for d in pool if d != exclude] if exclude else pool
     if not choices:
-        choices = target_pool
+        choices = pool
     return random.choice(choices)
 
 def is_stall_draft(text: str) -> bool:
@@ -43,8 +48,11 @@ def is_stall_draft(text: str) -> bool:
     if not text:
         return False
     t_clean = text.strip()
+    target_lower = os.getenv("TARGET_CONTACT_NAME", "PersonName").lower()
     return (
         t_clean in OFFLINE_STALL_DRAFTS
         or t_clean in QUOTA_EXHAUSTED_DRAFTS
+        or f"m rlyy sorryy {target_lower}" in t_clean
         or "m rlyy sorryy aarushii" in t_clean
     )
+

@@ -25,11 +25,22 @@ from src.core.memory_manager import (
     update_pending_card_status,
     update_pending_card_draft,
     delete_pending_card,
+    add_pending_message,
+    pop_pending_messages,
 )
+
+try:
+    from src.gateways.whatsapp_webhook import ACTIVE_TIMERS, debounce_and_dispatch
+except ImportError:
+    ACTIVE_TIMERS = {}
+    debounce_and_dispatch = None
 
 from src.core.fallbacks import get_random_fallback, OFFLINE_STALL_DRAFTS, QUOTA_EXHAUSTED_DRAFTS, is_stall_draft
 from src.core.database import get_config
-from src.core.config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+from src.core.config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TARGET_NAME, TARGET_PHONE, CHECKPOINT_DB_PATH, DATA_DIR
+
+TARGET_NAME = os.getenv("TARGET_CONTACT_NAME", TARGET_NAME or "PersonName")
+TARGET_PHONE = os.getenv("TARGET_PHONE_NUMBER", TARGET_PHONE or "")
 
 # 1. Define AgentState Schema
 class AgentState(TypedDict, total=False):
@@ -61,7 +72,7 @@ async def background_recovery_worker(incoming_text: str, vibe_context=None, db_i
     """
     if isinstance(vibe_context, dict):
         if not sender_id:
-            sender_id = vibe_context.get("sender_id", "Aarushi")
+            sender_id = vibe_context.get("sender_id", TARGET_NAME)
         if not messages:
             messages = vibe_context.get("messages", [])
         if not db_id:
@@ -77,13 +88,59 @@ async def background_recovery_worker(incoming_text: str, vibe_context=None, db_i
             state_input = {
                 "incoming_text": incoming_text,
                 "messages": messages or [],
-                "sender_id": sender_id or "Aarushi",
+                "sender_id": sender_id or TARGET_NAME,
                 "message_id": db_id
             }
             res = await asyncio.to_thread(gemini_proxy_node, state_input)
-            draft = res.get("draft_text", "")
+            
+            # Safe unpacking: handle res is None or draft is None/empty
+            if res is None:
+                print(f"[Recovery Worker] ❌ Generator returned None for thread {db_id}!")
+                failed_thread_id = str(uuid.uuid4())[:8]
+                failed_state = {
+                    "message_id": failed_thread_id,
+                    "sender_id": sender_id or TARGET_NAME,
+                    "incoming_text": incoming_text,
+                    "draft_text": "[GENERATION FAILED] Generator returned NoneType.",
+                    "messages": messages or [],
+                    "is_fallback": True,
+                    "server_recovered": False
+                }
+                await asyncio.to_thread(send_to_telegram, failed_state)
+                break
 
-            if not draft or draft.startswith("⚠️ [GEMINI ERROR:") or is_quota_fallback_text(draft):
+            draft = res.get("draft_text", "") if isinstance(res, dict) else ""
+            if draft is None or not str(draft).strip():
+                print(f"[Recovery Worker] ❌ Generator returned empty draft for thread {db_id}!")
+                failed_thread_id = str(uuid.uuid4())[:8]
+                failed_state = {
+                    "message_id": failed_thread_id,
+                    "sender_id": sender_id or TARGET_NAME,
+                    "incoming_text": incoming_text,
+                    "draft_text": "[GENERATION FAILED] Model returned empty response (Safety filter or NoneType).",
+                    "messages": messages or [],
+                    "is_fallback": True,
+                    "server_recovered": False
+                }
+                await asyncio.to_thread(send_to_telegram, failed_state)
+                break
+
+            if str(draft).startswith("Error:") or "[GENERATION FAILED]" in str(draft):
+                print(f"[Recovery Worker] ❌ Model blocked or returned error for thread {db_id}: {draft}")
+                failed_thread_id = str(uuid.uuid4())[:8]
+                failed_state = {
+                    "message_id": failed_thread_id,
+                    "sender_id": sender_id or TARGET_NAME,
+                    "incoming_text": incoming_text,
+                    "draft_text": f"[GENERATION FAILED] {draft}",
+                    "messages": messages or [],
+                    "is_fallback": True,
+                    "server_recovered": False
+                }
+                await asyncio.to_thread(send_to_telegram, failed_state)
+                break
+
+            if draft.startswith("⚠️ [GEMINI ERROR:") or is_quota_fallback_text(draft):
                 print(f"[Recovery Worker] ⏳ API still unavailable ({draft[:60]}...). Retrying in 60s.")
                 continue
 
@@ -91,7 +148,7 @@ async def background_recovery_worker(incoming_text: str, vibe_context=None, db_i
             recovered_thread_id = str(uuid.uuid4())[:8]
             recovered_state = {
                 "message_id": recovered_thread_id,
-                "sender_id": sender_id or "Aarushi",
+                "sender_id": sender_id or TARGET_NAME,
                 "incoming_text": incoming_text,
                 "draft_text": draft,
                 "messages": messages or [],
@@ -109,7 +166,21 @@ async def background_recovery_worker(incoming_text: str, vibe_context=None, db_i
             await asyncio.to_thread(send_to_telegram, recovered_state)
             break
         except Exception as e:
-            print(f"[Recovery Worker] ⏳ Poll attempt exception ({e}). Retrying in 60s.")
+            print(f"[Recovery Worker] ⏳ Poll attempt exception ({e}). Sending failure alert & retrying in 60s.")
+            try:
+                failed_thread_id = str(uuid.uuid4())[:8]
+                failed_state = {
+                    "message_id": failed_thread_id,
+                    "sender_id": sender_id or TARGET_NAME,
+                    "incoming_text": incoming_text,
+                    "draft_text": f"[GENERATION FAILED] {type(e).__name__}: {str(e)[:100]}",
+                    "messages": messages or [],
+                    "is_fallback": True,
+                    "server_recovered": False
+                }
+                await asyncio.to_thread(send_to_telegram, failed_state)
+            except Exception as tg_err:
+                print(f"[Recovery Worker] Error sending failure card to Telegram: {tg_err}")
             continue
 
 def process_incoming_message(state: AgentState):
@@ -124,8 +195,8 @@ def process_incoming_message(state: AgentState):
 
     try:
         res = gemini_proxy_node(state)
-        draft = res.get("draft_text", "")
-        if not draft or draft.startswith("⚠️ [GEMINI ERROR:") or is_quota_fallback_text(draft):
+        draft = res.get("draft_text", "") if isinstance(res, dict) else ""
+        if not draft or draft.startswith("⚠️ [GEMINI ERROR:") or draft.startswith("Error:") or is_quota_fallback_text(draft):
             raise Exception(f"Gemini API unavailable: {draft}")
         return {
             "draft_text": draft,
@@ -134,7 +205,8 @@ def process_incoming_message(state: AgentState):
         }
     except Exception as e:
         err_str = str(e).lower()
-        is_429 = any(k in err_str for k in ["429", "quota", "resource_exhausted", "m rlyy sorryy aarushii"])
+        target_lower = TARGET_NAME.lower()
+        is_429 = any(k in err_str for k in ["429", "quota", "resource_exhausted", f"m rlyy sorryy {target_lower}", "m rlyy sorryy aarushii"])
         error_type = 429 if is_429 else 503
 
         print(f"[Orchestrator] ⚠️ Gemini proxy failed across keys (error_type={error_type}, err={e}). Triggering Zero-Token Fallback...")
@@ -199,20 +271,35 @@ def send_to_telegram(state: AgentState):
     print(f"[Telegram Dispatch] Preparing approval card for thread {thread_id} (is_fallback={is_fallback}, server_recovered={server_recovered})...")
     
     if is_fallback:
-        text = (
-            "⚠️ [API OFFLINE] Google Servers Down.\n\n"
-            f"📩 Incoming: \"{incoming}\"\n\n"
-            f"🤖 Proposed Stall (Local): \"{draft}\"\n\n"
-            "(A background worker is polling the API and will notify you when it recovers.)"
-        )
-        keyboard = {
-            "inline_keyboard": [
-                [
-                    {"text": "Send Stall Excuse ✅", "callback_data": f"approve:{thread_id}"},
-                    {"text": "🎲 Swap Excuse", "callback_data": f"cycle_fallback:{thread_id}"}
+        if "[GENERATION FAILED]" in str(draft):
+            text = (
+                "❌ [GENERATION FAILED]\n\n"
+                f"📩 Incoming: \"{incoming}\"\n\n"
+                f"⚠️ Error: {draft}\n\n"
+                "(The background generator encountered an error or empty model response.)"
+            )
+            keyboard = {
+                "inline_keyboard": [
+                    [
+                        {"text": "Regenerate 🔄", "callback_data": f"edit:{thread_id}"}
+                    ]
                 ]
-            ]
-        }
+            }
+        else:
+            text = (
+                "⚠️ [API OFFLINE] Google Servers Down.\n\n"
+                f"📩 Incoming: \"{incoming}\"\n\n"
+                f"🤖 Proposed Stall (Local): \"{draft}\"\n\n"
+                "(A background worker is polling the API and will notify you when it recovers.)"
+            )
+            keyboard = {
+                "inline_keyboard": [
+                    [
+                        {"text": "Send Stall Excuse ✅", "callback_data": f"approve:{thread_id}"},
+                        {"text": "🎲 Swap Excuse", "callback_data": f"cycle_fallback:{thread_id}"}
+                    ]
+                ]
+            }
     else:
         if server_recovered:
             header = "🟢 [SERVER RECOVERED] Fresh AI Draft"
@@ -300,7 +387,7 @@ def process_human_feedback(state: AgentState):
             new_draft = proxy_res.get("draft_text", "")
         else:
             prompt = (
-                f"Aarushi sent this message:\n'{incoming_text}'\n\n"
+                f"{TARGET_NAME} sent this message:\n'{incoming_text}'\n\n"
                 f"Please draft Siddharth's reply following these instructions:\n'{feedback}'\n\n"
                 f"Output ONLY Siddharth's raw text message reply (multi-line bursts are natural). Do not include quotes."
             )
@@ -436,8 +523,8 @@ builder.add_edge("dispatch_message", END)
 builder.add_conditional_edges("wait_for_human_action", route_after_human)
 
 # 5. Set up Persistence and Compile
-os.makedirs("data", exist_ok=True)
-conn = sqlite3.connect("data/checkpoint.sqlite", check_same_thread=False)
+os.makedirs(DATA_DIR, exist_ok=True)
+conn = sqlite3.connect(CHECKPOINT_DB_PATH, check_same_thread=False)
 sqlite_saver = SqliteSaver(conn)
 sqlite_saver.setup()
 
@@ -449,7 +536,7 @@ app = builder.compile(
 # 6. Helper Functions for Integration
 def handle_incoming_whatsapp_burst(sender_id: str, combined_incoming: str, lines: Optional[list] = None):
     """
-    Handles a debounced WhatsApp burst from Aarushi.
+    Handles a debounced WhatsApp burst from the target contact.
     1. Saves each incoming line to SQLite short-term memory in order.
     2. Does NOT re-append previously carded messages.
     3. Invokes Gemini proxy node with this fresh burst.
@@ -461,11 +548,11 @@ def handle_incoming_whatsapp_burst(sender_id: str, combined_incoming: str, lines
     if lines:
         for line in lines:
             if line.strip():
-                save_message("Aarushi", line.strip())
+                save_message(TARGET_NAME, line.strip())
     else:
         for line in combined_incoming.split("\n"):
             if line.strip():
-                save_message("Aarushi", line.strip())
+                save_message(TARGET_NAME, line.strip())
                 
     thread_id = str(uuid.uuid4())[:8]
     print(f"[Orchestrator] Fresh debounced burst from {sender_id} (thread {thread_id}): '{combined_incoming[:60]}...'")

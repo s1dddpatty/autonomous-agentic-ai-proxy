@@ -10,8 +10,8 @@ def main():
         except ValueError:
             pass
 
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    db_path = os.path.join(base_dir, "data/chats.db")
+    from src.core.config import DB_PATH
+    db_path = DB_PATH
 
     if not os.path.exists(db_path):
         print(f"❌ Database not found at {db_path}")
@@ -31,12 +31,13 @@ def main():
     """, (limit,))
     rows = cursor.fetchall()
 
+    target_name = os.getenv("TARGET_CONTACT_NAME", "PersonName")
     if not rows:
         print("No messages recorded yet.")
     else:
         for mid, role, content, ts in reversed(rows):
-            if role.lower() == "aarushi":
-                prefix = f"🌸 [Aarushi | {ts}]"
+            if role.lower() in [target_name.lower(), "aarushi"]:
+                prefix = f"🌸 [{target_name} | {ts}]"
             else:
                 prefix = f"💬 [Siddharth (Dispatched) | {ts}]"
             print(f"\n{prefix} (ID #{mid}):")
@@ -60,7 +61,7 @@ def main():
         for t_id, status, incoming, draft, created_at in cards:
             status_icon = "⏳ Pending" if status == "pending" else ("✅ Approved" if status == "approved" else "❌ Discarded")
             print(f"\nCard #{t_id} [{status_icon}] ({created_at}):")
-            print(f"   📩 Aarushi: \"{incoming.replace(chr(10), ' / ')}\"")
+            print(f"   📩 {target_name}: \"{incoming.replace(chr(10), ' / ')}\"")
             first_line_draft = draft.split(chr(10))[0] if draft else ""
             print(f"   🤖 Draft:   \"{first_line_draft}...\"")
 

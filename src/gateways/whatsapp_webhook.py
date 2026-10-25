@@ -8,38 +8,44 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from src.core.config import VERIFY_TOKEN
+from src.core.memory_manager import add_pending_message, pop_pending_messages
 
 app = FastAPI()
 
 # -------------------------------------------------------------
-# 3-SECOND ASYNC DEBOUNCE BUFFER
+# 10-SECOND STRICT ASYNC DEBOUNCE LOCK FOR MESSAGE BURSTS
 # -------------------------------------------------------------
-DEBOUNCE_SECONDS = 3.0
-debounce_buffers: Dict[str, List[str]] = {}
-debounce_tasks: Dict[str, asyncio.Task] = {}
+DEBOUNCE_SECONDS = 10.0
+ACTIVE_TIMERS: Dict[str, asyncio.Task] = {}
 
-async def flush_debounce_buffer(sender_id: str):
+async def debounce_and_dispatch(chat_id: str):
     """
-    Waits 3.0 seconds. If no new message arrives from this sender,
-    pops and clears the buffer and triggers one single pipeline execution.
+    Waits exactly 10.0 seconds for the user to finish typing.
+    Once the 10-second sleep finishes:
+    1. Strictly removes chat_id from ACTIVE_TIMERS.
+    2. Pulls all pending messages for that chat_id from the SQLite buffer.
+    3. Concatenates them into a single string (joined_text = "\n".join(messages)).
+    4. Passes this single joined_text block to the Gemini node via handle_incoming_whatsapp_burst.
     """
     try:
         await asyncio.sleep(DEBOUNCE_SECONDS)
     except asyncio.CancelledError:
         return
-        
-    lines = debounce_buffers.pop(sender_id, [])
-    debounce_tasks.pop(sender_id, None)
-    
-    if not lines:
+    finally:
+        ACTIVE_TIMERS.pop(chat_id, None)
+
+    # Pull all pending messages for that chat_id from the SQLite buffer
+    messages = pop_pending_messages(chat_id)
+    if not messages:
         return
-        
-    combined_burst = "\n".join(lines)
-    print(f"[Debounce Buffer] ⚡ Flushed {len(lines)} message(s) for {sender_id}:\n{combined_burst}")
-    
+
+    # Concatenate them into a single string
+    joined_text = "\n".join(messages)
+    print(f"[Debounce Lock] ⚡ Debounce elapsed (10.0s). Flushed {len(messages)} message(s) for {chat_id}:\n{joined_text}")
+
     from src.core.orchestrator import handle_incoming_whatsapp_burst
-    # Run in a thread worker so the asyncio event loop remains responsive
-    await asyncio.to_thread(handle_incoming_whatsapp_burst, sender_id, combined_burst, lines)
+    # Pass this single joined_text block to Gemini so it processes the entire burst as one prompt
+    await asyncio.to_thread(handle_incoming_whatsapp_burst, chat_id, joined_text, messages)
 
 @app.get("/webhook")
 async def verify_webhook(
@@ -58,40 +64,40 @@ async def verify_webhook(
 @app.post("/webhook")
 async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
     """
-    Parses incoming JSON payloads from WhatsApp with 3-second debouncing.
+    Parses incoming JSON payloads from WhatsApp with 10-second debounce lock.
     """
     body = await request.json()
     
     # Safely inspect the payload for incoming messages
     try:
-        # WhatsApp payloads can be deeply nested
         entry = body.get("entry", [])[0]
         changes = entry.get("changes", [])[0]
         value = changes.get("value", {})
         
         # Skip read/delivery status updates (they contain "statuses" instead of "messages")
         if "messages" in value:
-            message = value["messages"][0]
-            sender_id = message.get("from")
-            
-            if message.get("type") == "text":
-                text = message.get("text", {}).get("body")
-                if text:
-                    print(f"[Webhook Received] From {sender_id}: {text}")
-                    
-                    # 1. Cancel existing debounce countdown for this sender if running
-                    existing_task = debounce_tasks.get(sender_id)
-                    if existing_task and not existing_task.done():
-                        existing_task.cancel()
-                        
-                    # 2. Append to sender's burst buffer
-                    if sender_id not in debounce_buffers:
-                        debounce_buffers[sender_id] = []
-                    debounce_buffers[sender_id].append(text)
-                    
-                    # 3. Schedule fresh 3.0-second countdown
-                    debounce_tasks[sender_id] = asyncio.create_task(flush_debounce_buffer(sender_id))
+            for message in value.get("messages", []):
+                sender_id = message.get("from")
                 
+                if message.get("type") == "text":
+                    text = message.get("text", {}).get("body")
+                    if text and sender_id:
+                        chat_id = str(sender_id)
+                        print(f"[Webhook Received] From {chat_id}: {text}")
+                        
+                        # 1. Instantly save to SQLite pending buffer
+                        add_pending_message(chat_id, text)
+                        
+                        # 2. Check if an asyncio task is already running in ACTIVE_TIMERS for that specific chat_id
+                        existing_timer = ACTIVE_TIMERS.get(chat_id)
+                        if existing_timer and not existing_timer.done():
+                            # If YES: Do nothing. The message is safely in the database and the existing timer will grab it.
+                            print(f"[Debounce Lock] 🔒 Active timer running for {chat_id}. Message buffered in SQLite.")
+                        else:
+                            # If NO: Spawn a new async background task that sleeps for exactly 10.0 seconds
+                            print(f"[Debounce Lock] ⏱️ Spawning 10.0s debounce timer task for {chat_id}.")
+                            ACTIVE_TIMERS[chat_id] = asyncio.create_task(debounce_and_dispatch(chat_id))
+                    
     except IndexError:
         pass
     except Exception as e:

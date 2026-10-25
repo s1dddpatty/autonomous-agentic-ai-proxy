@@ -1,14 +1,13 @@
 import sqlite3
 import os
 from typing import Optional
-
-DB_PATH = "data/chats.db"
+from src.core.config import DB_PATH, DATA_DIR
 
 def init_db():
     """
     Initializes the database schema including the config table and default settings.
     """
-    os.makedirs(os.path.dirname(DB_PATH) if os.path.dirname(DB_PATH) else ".", exist_ok=True)
+    os.makedirs(DATA_DIR, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
@@ -22,6 +21,17 @@ def init_db():
     
     # Insert default row if not already present
     cursor.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('mode', 'training')")
+    
+    # 2. SQLite pending message debounce buffer
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS pending_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id TEXT NOT NULL,
+            text TEXT NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_pending_messages_chat ON pending_messages(chat_id)')
     
     conn.commit()
     conn.close()
@@ -59,5 +69,66 @@ def set_config(key: str, value: str):
     conn.commit()
     conn.close()
 
+def add_pending_message(chat_id: str, text: str):
+    """
+    Saves an incoming message directly into the SQLite pending debounce buffer.
+    """
+    init_db()
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO pending_messages (chat_id, text) VALUES (?, ?)",
+        (str(chat_id), text)
+    )
+    conn.commit()
+    conn.close()
+
+def pop_pending_messages(chat_id: str) -> list[str]:
+    """
+    Atomically retrieves and removes all buffered pending messages for a chat_id in order of arrival.
+    """
+    init_db()
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id, text FROM pending_messages WHERE chat_id = ? ORDER BY id ASC",
+        (str(chat_id),)
+    )
+    rows = cursor.fetchall()
+    if rows:
+        ids = [r[0] for r in rows]
+        placeholders = ",".join("?" for _ in ids)
+        cursor.execute(f"DELETE FROM pending_messages WHERE id IN ({placeholders})", ids)
+        conn.commit()
+    conn.close()
+    return [r[1] for r in rows]
+
+def get_pending_messages(chat_id: str) -> list[str]:
+    """
+    Retrieves all buffered pending messages for a chat_id without removing them.
+    """
+    init_db()
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT text FROM pending_messages WHERE chat_id = ? ORDER BY id ASC",
+        (str(chat_id),)
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+def clear_pending_messages(chat_id: str):
+    """
+    Clears all buffered pending messages for a chat_id.
+    """
+    init_db()
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM pending_messages WHERE chat_id = ?", (str(chat_id),))
+    conn.commit()
+    conn.close()
+
 # Initialize tables upon module import
 init_db()
+
