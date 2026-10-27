@@ -83,6 +83,8 @@ def generate_standalone_query(incoming_text: str, messages: Optional[List[Dict]]
     prompt = f"""You are a query rewriter for retrieving facts and dates from a couple's relationship diary (Memories.md).
 Based on the recent conversation context and the latest message, write a concise standalone search query (3 to 8 words) that captures what past fact, date, event, or memory is being asked about.
 
+CRITICAL: Do not hallucinate or invent context, dates, or events. If the user's message is extremely brief or ambiguous (e.g., 'boll', 'kab', 'tell me'), and the exact entity is not explicitly clear from the recent chat history, DO NOT invent a search query. Instead, output the standalone query exactly as the literal translation of the user's message without adding any guessed details.
+
 Recent Conversation Context (Last 3-4 messages):
 {history_str}
 
