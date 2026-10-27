@@ -17,7 +17,6 @@ GEMINI_API_KEYS = GEMINI_KEYS
 from src.core.memory_manager import get_recent_feedback, get_recent_history
 from src.core.vector_memory import retrieve_dual_context, retrieve_relevant_facts
 from src.core.metrics import log_api_usage
-from src.core.fallbacks import get_random_fallback
 
 def extract_clean_text(response) -> str:
     """
@@ -163,11 +162,9 @@ def build_quota_exhausted_draft(error_msg: str = "") -> str:
         "muahh i love youuu ❤️💖🫶🏻💕"
     )
 
-# Primary & Fallback model definitions
-PRIMARY_MODEL = os.getenv("PRIMARY_MODEL", "gemini-1.5-flash")
-FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "gemini-1.5-flash-8b")
-MODEL_NAME = PRIMARY_MODEL
-ACTIVE_PRIMARY_MODEL = "gemini-flash-latest"
+# Model initialization strictly reads:
+# google.generativeai.GenerativeModel("gemini-1.5-flash-8b")
+MODEL_NAME = "gemini-1.5-flash-8b"
 ACTIVE_FALLBACK_MODEL = "gemini-flash-lite-latest"
 REQUEST_TIMEOUT_SECONDS = 8.0
 _active_key_index = 0
@@ -183,7 +180,11 @@ def _create_genai_client(api_key: str):
 
 def _call_model_with_timeout(client, model: str, contents, config=None, request_options=None):
     """
-    Enforces aggressive 8-second fail-fast timeout and active model fallback if 1.5 versions are retired.
+    Enforces aggressive 8-second fail-fast timeout and model fallback if 1.5-8b is retired.
+    # response = await model.generate_content_async(
+    #     contents=prompt,
+    #     request_options={"timeout": 8.0}
+    # )
     """
     timeout = REQUEST_TIMEOUT_SECONDS
     if request_options and "timeout" in request_options:
@@ -203,22 +204,15 @@ def _call_model_with_timeout(client, model: str, contents, config=None, request_
             config=config
         )
     except Exception as e:
-        err_msg = str(e).lower()
-        # If the model is retired/not found (404), seamlessly map to active equivalent
-        if "404" in str(e) and ("not found" in err_msg or "no longer available" in err_msg):
-            alt_model = None
-            if "8b" in model:
-                alt_model = ACTIVE_FALLBACK_MODEL
-            elif "flash" in model:
-                alt_model = ACTIVE_PRIMARY_MODEL
-
-            if alt_model and alt_model != model:
-                print(f"[Gemini Node] Model '{model}' not found on endpoint. Mapping to '{alt_model}'...")
-                return client.models.generate_content(
-                    model=alt_model,
-                    contents=contents,
-                    config=config
-                )
+        # If gemini-1.5-flash-8b is not found / retired on current API version,
+        # seamlessly fallback to its active successor gemini-flash-lite-latest
+        if "404" in str(e) and "not found" in str(e).lower() and model == "gemini-1.5-flash-8b":
+            print(f"[Gemini Node] Model '{model}' not found. Falling back to active lightweight tier '{ACTIVE_FALLBACK_MODEL}'...")
+            return client.models.generate_content(
+                model=ACTIVE_FALLBACK_MODEL,
+                contents=contents,
+                config=config
+            )
         raise
 
 def is_quota_error(e: Exception) -> bool:
@@ -246,7 +240,7 @@ def is_quota_fallback_text(text: str) -> bool:
         or "ill be back in " in t_lower
     )
 
-def generate_with_key_rotation(contents, config=None, model: str = PRIMARY_MODEL) -> str:
+def generate_with_key_rotation(contents, config=None) -> str:
     """
     Generates draft responses using GEMINI_KEYS from config.py.
     If ENABLE_KEY_ROTATION is False or only 1 key is provided, disables sleep backoffs
@@ -267,7 +261,7 @@ def generate_with_key_rotation(contents, config=None, model: str = PRIMARY_MODEL
             client = _create_genai_client(single_key)
             response = _call_model_with_timeout(
                 client=client,
-                model=model,
+                model=MODEL_NAME,
                 contents=contents,
                 config=config,
                 request_options={"timeout": 8.0}
@@ -287,7 +281,7 @@ def generate_with_key_rotation(contents, config=None, model: str = PRIMARY_MODEL
             )
             raw_draft = extract_clean_text(response)
             draft = sanitize_draft(raw_draft)
-            print(f"[Gemini Node] Successfully generated draft with {model}: '{draft[:60]}...'")
+            print(f"[Gemini Node] Successfully generated draft with {MODEL_NAME}: '{draft[:60]}...'")
             return draft
         except Exception as e:
             latency_ms = (time.time() - start_time) * 1000
@@ -319,7 +313,7 @@ def generate_with_key_rotation(contents, config=None, model: str = PRIMARY_MODEL
             client = _create_genai_client(current_key)
             response = _call_model_with_timeout(
                 client=client,
-                model=model,
+                model=MODEL_NAME,
                 contents=contents,
                 config=config,
                 request_options={"timeout": 8.0}
@@ -339,7 +333,7 @@ def generate_with_key_rotation(contents, config=None, model: str = PRIMARY_MODEL
             )
             raw_draft = extract_clean_text(response)
             draft = sanitize_draft(raw_draft)
-            print(f"[Gemini Node] Successfully generated draft using Key #{idx + 1} with {model}: '{draft[:60]}...'")
+            print(f"[Gemini Node] Successfully generated draft using Key #{idx + 1} with {MODEL_NAME}: '{draft[:60]}...'")
             return draft
         except Exception as e:
             latency_ms = (time.time() - start_time) * 1000
@@ -352,7 +346,7 @@ def generate_with_key_rotation(contents, config=None, model: str = PRIMARY_MODEL
             last_error = e
             if is_quota_error(e):
                 quota_exhausted_keys.add(idx)
-                print(f"[Gemini Node] 🔑 Key #{idx + 1} hit quota limit! Rotating to Key #{next_idx + 1} on {model}...")
+                print(f"[Gemini Node] 🔑 Key #{idx + 1} hit quota limit! Rotating to Key #{next_idx + 1} on {MODEL_NAME}...")
                 _active_key_index = next_idx
                 if len(quota_exhausted_keys) >= total_keys:
                     print(f"[Gemini Node] ⚡ All {total_keys} API keys exhausted! Returning in-character rest fallback.")
@@ -367,71 +361,16 @@ def generate_with_key_rotation(contents, config=None, model: str = PRIMARY_MODEL
                     time.sleep(delay)
                     continue
                 else:
-                    print(f"[Gemini Node] Server high demand backoff retries exhausted ({len(backoff_delays)} attempts on {model}).")
+                    print(f"[Gemini Node] Server high demand backoff retries exhausted ({len(backoff_delays)} attempts on {MODEL_NAME}).")
                     return f"⚠️ [GEMINI ERROR: {type(e).__name__}: {str(e)[:150]}]"
             else:
-                print(f"[Gemini Node] Model {model} failed with non-quota error:\n{traceback.format_exc()}")
+                print(f"[Gemini Node] Model {MODEL_NAME} failed with non-quota error:\n{traceback.format_exc()}")
                 return f"⚠️ [GEMINI ERROR: {type(e).__name__}: {str(e)[:150]}]"
 
     if len(quota_exhausted_keys) >= total_keys:
         print(f"[Gemini Node] ⚡ All {total_keys} API keys exhausted! Returning in-character rest fallback.")
         return build_quota_exhausted_draft(str(last_error))
     return f"⚠️ [GEMINI ERROR: {type(last_error).__name__ if last_error else 'Unknown'}: {str(last_error)[:150] if last_error else 'Exhausted retries'}]"
-
-def invoke_fallback_8b(contents, config=None, model: str = FALLBACK_MODEL) -> str:
-    """
-    Cleanly instantiates and invokes the fallback 8b model across available keys.
-    """
-    global _active_key_index
-    if not GEMINI_KEYS:
-        raise Exception("No GEMINI_API_KEYS configured")
-
-    total_keys = len(GEMINI_KEYS)
-    last_err = None
-
-    for attempt in range(total_keys):
-        idx = (_active_key_index + attempt) % total_keys
-        key = GEMINI_KEYS[idx]
-        start_time = time.time()
-        try:
-            client = _create_genai_client(key)
-            response = _call_model_with_timeout(
-                client=client,
-                model=model,
-                contents=contents,
-                config=config,
-                request_options={"timeout": 8.0}
-            )
-            latency_ms = (time.time() - start_time) * 1000
-            prompt_tokens = 0
-            completion_tokens = 0
-            if hasattr(response, "usage_metadata") and response.usage_metadata:
-                prompt_tokens = getattr(response.usage_metadata, "prompt_token_count", 0) or 0
-                completion_tokens = getattr(response.usage_metadata, "candidates_token_count", 0) or 0
-            log_api_usage(
-                key_index=idx,
-                latency_ms=latency_ms,
-                status="SUCCESS",
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens
-            )
-            raw_draft = extract_clean_text(response)
-            draft = sanitize_draft(raw_draft)
-            print(f"[Gemini Node] Successfully generated draft using fallback {model} on Key #{idx + 1}: '{draft[:60]}...'")
-            return draft
-        except Exception as e:
-            latency_ms = (time.time() - start_time) * 1000
-            log_api_usage(
-                key_index=idx,
-                latency_ms=latency_ms,
-                status="FAILED",
-                error=f"{type(e).__name__}: {str(e)[:100]}"
-            )
-            print(f"[Gemini Node] Fallback model {model} attempt failed on Key #{idx + 1}: {e}")
-            last_err = e
-            continue
-
-    raise Exception(f"All keys exhausted for fallback model {model} (last error: {last_err})")
 
 GUARDRAILS_PATH = os.path.join(os.path.dirname(__file__), "../config/custom_guardrails.json")
 
@@ -470,107 +409,170 @@ def load_guardrails() -> str:
 
 def gemini_proxy_node(state: dict) -> dict:
     """
-    Drafting node: generates WhatsApp responses with strict tone constraints,
-    contextualized RAG from Memories.md, and safe High-to-Low model fallback
-    (gemini-1.5-flash -> gemini-1.5-flash-8b).
+    LangGraph node to generate WhatsApp responses using Gemini 3 Flash Preview
+    with Mood-Aware Trigger -> Burst Dual RAG context and 4-Step Brain Reasoning.
     """
+    # 1. Dynamically fetch the current time for grounding
+    now = datetime.now()
+    current_time_str = now.strftime("%A, %Y-%m-%d %I:%M %p")
+    
     incoming_text = state.get("incoming_text", "")
-    target_name = os.getenv("TARGET_CONTACT_NAME", TARGET_NAME or "PersonName")
+    
+    # 2. Retrieve Semantic JIT Facts (Top 3 relevant facts)
+    recalled_facts = retrieve_relevant_facts(incoming_text, k=3)
+    
+    # 3. Retrieve Dual RAG Context (Style Bursts + Episodic Memories)
+    dual_context = retrieve_dual_context(incoming_text, n_style=10, n_memory=10)
+    detected_mood = dual_context.get("detected_mood", "casual")
+    detected_stage = dual_context.get("detected_stage", "ongoing")
+    style_chunks = dual_context.get("style_chunks", "")
+    memory_chunks = dual_context.get("memory_chunks", "")
+    
+    print(f"[Gemini Node] Incoming: '{incoming_text}' | Vibe: mood='{detected_mood}', stage='{detected_stage}'")
+    
+    # 4. Load Custom Guardrails & Learned Feedback
+    custom_guardrails_str = load_guardrails()
+    
+    recent_feedback = get_recent_feedback(limit=5)
+    learned_corrections_str = ""
+    if recent_feedback:
+        corrections = []
+        for item in recent_feedback:
+            corrections.append(
+                f"Past Mistake: \"{item['original']}\"\n"
+                f"My Correction: \"{item['feedback']}\"\n"
+                f"Resulting Rule: I must output \"{item['revised']}\""
+            )
+        learned_corrections_str = "\n<LEARNED_STYLE_CORRECTIONS>\n" + "\n\n".join(corrections) + "\n</LEARNED_STYLE_CORRECTIONS>\n"
 
-    # 1. Ingest vibe, standalone query, and rag_context from Analyzer
-    vibe = state.get("vibe")
-    rag_context = state.get("rag_context")
-    if not vibe or rag_context is None:
-        from src.core.analyzer_node import analyzer_node
-        analysis = analyzer_node(state)
-        vibe = analysis.get("vibe", "dry, casual, and natural")
-        rag_context = analysis.get("rag_context", "No relevant memories found in Memories.md.")
-        state["vibe"] = vibe
-        state["standalone_search_query"] = analysis.get("standalone_search_query", "")
-        state["rag_context"] = rag_context
+    target_name = os.getenv("TARGET_CONTACT_NAME", "PersonName")
 
-    # 2. Strict Generation Node Prompting (Killing "Cringe" & Forcing Facts)
-    # Exact f-string architecture as required:
-    system_prompt = f"""You are texting your girlfriend. Your default tone is dry, casual, and natural.
-
-CRITICAL TONE RULES:
-1. NO CRINGE: Never use poetic language, forced punchlines, or dramatic flair.
-2. EMOJI LIMIT: Maximum one emoji per message.
-3. CURRENT VIBE: Match this specific energy for this message -> {vibe}
-
-CRITICAL GROUNDING RULE: If the user's message is vague (e.g., 'boll', 'kab') and the retrieved context does not contain a specific, explicitly matching date or fact, YOU MUST NOT hallucinate, guess, or invent dates (such as February 14). Instead, respond naturally in the established tone asking for clarification (e.g., 'kis baare mein?', 'kya bolu?').
-
-FACTUAL OVERRIDE:
-If she asks a question about a past event, memory, or specific fact:
-- You MUST playfully accuse her of "testing" you.
-- You MUST explicitly state the exact answer retrieved from the CONTEXT below in the very same message.
-- NEVER dodge the question to make a joke. NEVER guess, hallucinate, or assume facts.
-
-CONTEXT FROM MEMORIES.MD:
-{rag_context}
-"""
-
-    # 3. Format recent conversation history
+    # 5. Extract input and history from State & SQLite
     messages_history = state.get("messages", [])
     if not messages_history:
         messages_history = get_recent_history(limit=20)
-
+        
     history_lines = []
     for msg in messages_history:
-        role = msg.get("role", "")
-        role_name = "Siddharth" if role in ["Siddharth", "ai", "model", "gpt"] else target_name
-        content = (msg.get("content") or msg.get("text") or "").strip()
+        role_name = "Siddharth" if msg.get("role") in ["Siddharth", "ai", "model", "gpt"] else target_name
+        content = msg.get("content", "").strip()
         if content:
             history_lines.append(f"{role_name}: {content}")
-
+            
     history_str = "\n".join(history_lines) if history_lines else "No prior history recorded."
+    
+    # 6. Build Mega-Prompt with 4-Step Brain Architecture
+    system_instruction = f"""You are Siddharth, a 21-year-old B.Tech student at SPIT in Mumbai. 
+You are texting your girlfriend {target_name} on WhatsApp.
 
-    prompt_content = f"""Recent Chat History:
+[CURRENT DATE & TIME]: {current_time_str}
+[DETECTED VIBE]: Conversation Stage = "{detected_stage.upper()}", Mood = "{detected_mood.upper()}"
+{custom_guardrails_str}
+{learned_corrections_str}
+
+=== 4-STEP REASONING & GENERATION FRAMEWORK ===
+Step 1 (Stage & Intent Check):
+- Current detected stage: "{detected_stage}"
+- Inspect the detected conversation stage and recent chat history.
+- CRITICAL: If {target_name} is opening a conversation (e.g., "heyy", "wassup", "morning") or asking a question, NEVER end the conversation or say goodnight—greet her back warmly and talk or answer directly based on [CURRENT DATE & TIME], even if it is late at night.
+- ONLY initiate closing/goodnight sequences if she is explicitly closing the conversation (e.g., saying goodnight, sleeping, bye).
+- MULTI-POINT CONTEXT AWARENESS: When {target_name} sends multiple lines or distinct statements in a burst, do not ignore earlier statements just to answer the last line. Acknowledge her thoughts naturally, but do not feel obligated to mirror her exact message count.
+
+Step 2 (Mood & Tone Calibration):
+- Current detected mood: "{detected_mood}"
+- Calibrate your emotional warmth, slang, and emoji usage to match her emotional vibe:
+  * "affectionate": warm, loving, sweet emojis (😴, ✨️, 💖, 🫶)
+  * "playful": light teasing, funny Hinglish banter, laughing emojis (😂, 😭), shorthand ("lmao", "pagal")
+  * "sarcastic": match the dry banter and irony smoothly, never be dismissive or rude
+  * "serious_upset": drop all sarcasm, jokes, and shorthand; provide genuine reassurance, attentiveness, and mature comfort
+  * "casual": relaxed, chill, everyday conversational Hinglish ("ha", "thik", "wbu", "nw")
+
+Step 3 (Top-10 Pattern Synthesis vs. Copy-Pasting & Message Segmentation):
+- Study <TOP_10_SITUATIONAL_STYLE_BURSTS> below.
+- Do NOT blindly copy-paste outdated facts, past events, or specific random plans from these bursts.
+- Instead, synthesize Siddharth's exact texting style: short multi-line burst structure (multiple rapid bubbles joined by newlines), shorthand words ("heyyy", "Wbu", "nw", "m", "idk", "btw"), lack of formal punctuation, and typing cadence.
+- EXCEPTION: If the situational style bursts or <CUSTOM_GUARDRAILS> demonstrate a consistent signature ritual (such as the sacred multi-line goodnight sequence when she says goodnight), output that full signature sequence.
+
+CRITICAL FORMATTING INSTRUCTION:
+When responding to a multi-line burst from {target_name}, DO NOT automatically reply with the exact same number of lines. You are not a mirror.
+- Evaluate the context and mood.
+- You can reply with a single, concise sentence that addresses everything.
+- You can reply with two short texts.
+- Do NOT feel obligated to match her message count. Often, a single well-crafted text is more natural than firing back 4 separate texts just because she sent 4.
+- If she sends a wall of text, you can respond with just one short line. Prioritize natural, flowing conversation over strict 1:1 line matching.
+
+Step 4 (Deep Memory & Feedback Override):
+- Use <RECALLED_EPISODIC_MEMORIES> only when relevant to specific past events or facts she references.
+- ALWAYS obey <LEARNED_STYLE_CORRECTIONS> and <CUSTOM_GUARDRAILS> as absolute top-priority constraints overriding all other patterns.
+
+FEW-SHOT TEXTING EXAMPLES:
+Example 1 (Casual opener):
+{target_name}: heyyy
+Siddharth:
+Heyyy
+Kaisi hai?
+
+Example 2 (Closing / Goodnight):
+{target_name}: okay goodnightt
+Siddharth:
+Goodnight
+Sweet dreams 😴 ✨️ 💖
+Sleep tight and dont let the bed bugs bite 😴 😌 ✨️
+Loveya
+Take care
+Sleep well n dream well 😴 💖 💓
+Buhbyeee🫶✨💖
+
+Example 3 (Multi-line burst — natural dynamic response):
+{target_name}:
+bohot thak gayi yaar
+itna bheed tha waha
+normal dress n all liya
+tu kya kar raha hai abhi?
+Siddharth:
+Aree Sunday ko itne dhakke khaake 'normal dress' liya? 😂
+Paani pi le aaram se, mai bas bed pe pada hu
+
+YOUR GENERAL PERSONA:
+- MFA 3rd Div football player, Python/ML coder at SPIT Mumbai.
+- Warm, affectionate, chill human boyfriend texting his girlfriend {target_name}.
+- NEVER output placeholder tags like <image omitted> or <Media omitted>. You are texting in real time; output only real text and emojis.
+- Output ONLY your raw text message reply (multi-line bursts separated by newlines are natural). Do not include quotes, JSON, or speaker prefixes.
+CRITICAL OUTPUT RULE: Never output your internal checklist, bullet points (* or -), '/think' tags, or meta-commentary like 'Vibe is casual' or 'Stage is ongoing'. Do all reasoning silently. Output ONLY the raw Hinglish chat lines that Siddharth sends on WhatsApp.
+"""
+
+    if recalled_facts:
+        facts_lines = "\n".join(f"- {f}" for f in recalled_facts)
+        system_instruction += (
+            f"\n\nRELEVANT RECALLED FACTS FOR THIS CONTEXT:\n"
+            f"{facts_lines}\n"
+            f"(Use these facts naturally in your response if they fit the context, but do not force them. Do not sound like a robot reading a database.)"
+        )
+
+    LIVE_INPUT = f"""<TOP_10_SITUATIONAL_STYLE_BURSTS>
+{style_chunks}
+</TOP_10_SITUATIONAL_STYLE_BURSTS>
+
+<RECALLED_EPISODIC_MEMORIES>
+{memory_chunks}
+</RECALLED_EPISODIC_MEMORIES>
+
+Recent Chat History (Last 20 messages):
 {history_str}
 
 Current Trigger:
 {target_name}: {incoming_text}
 Siddharth:"""
 
-    generation_config = types.GenerateContentConfig(
+    # Set max_output_tokens=4096 so thinking_level='high' has ample token budget for full multi-line rituals
+    proxy_config = types.GenerateContentConfig(
         temperature=0.65,
-        max_output_tokens=2048,
+        max_output_tokens=4096,
         top_p=0.95,
-        system_instruction=system_prompt,
+        system_instruction=system_instruction,
+        thinking_config=types.ThinkingConfig(thinking_level='high')
     )
 
-    # 4. Safe High-to-Low Model Fallback Execution
-    draft = None
-    is_fallback = False
-
-    try:
-        # Primary Model generation with 5-key rotation mechanism
-        print(f"[Drafting Node] Attempting generation with primary model ({PRIMARY_MODEL}) via 5-key rotation...")
-        draft = generate_with_key_rotation(prompt_content, generation_config, model=PRIMARY_MODEL)
-        if not draft or draft.startswith("⚠️ [GEMINI ERROR:") or is_quota_fallback_text(draft) or draft.startswith("Error:"):
-            raise Exception(f"Primary model {PRIMARY_MODEL} exhausted or failed: {draft}")
-        is_fallback = False
-    except Exception as primary_error:
-        print(f"[Drafting Node] ⚠️ Primary model ({PRIMARY_MODEL}) failed: {primary_error}")
-        print(f"[Drafting Node] 🔄 Executing Safe Fallback: cleanly instantiating and invoking {FALLBACK_MODEL}...")
-        try:
-            # Fallback Model: gemini-1.5-flash-8b
-            draft = invoke_fallback_8b(prompt_content, generation_config, model=FALLBACK_MODEL)
-            if not draft or draft.startswith("⚠️ [GEMINI ERROR:") or draft.startswith("Error:"):
-                raise Exception(f"Fallback model {FALLBACK_MODEL} failed: {draft}")
-            is_fallback = True
-            print(f"[Drafting Node] ✅ Fallback model {FALLBACK_MODEL} generated draft: '{draft[:60]}...'")
-        except Exception as fallback_error:
-            print(f"[Drafting Node] ❌ Fallback model also failed ({fallback_error}). Triggering safe local excuse.")
-            draft = get_random_fallback(error_type=503)
-            is_fallback = True
-
-    return {
-        "draft_text": draft,
-        "status": "pending",
-        "is_fallback": is_fallback,
-        "vibe": vibe,
-        "rag_context": rag_context
-    }
-
-drafting_node = gemini_proxy_node
+    print(f"[Gemini Node] Generating draft response with {MODEL_NAME} (4096 tokens headroom)...")
+    draft = generate_with_key_rotation(LIVE_INPUT, proxy_config)
+    return {"draft_text": draft, "status": "pending"}

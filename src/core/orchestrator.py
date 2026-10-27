@@ -48,16 +48,11 @@ class AgentState(TypedDict, total=False):
     sender_id: str
     incoming_text: str
     messages: list
-    vibe: Optional[str]
-    standalone_search_query: Optional[str]
-    rag_context: Optional[str]
     draft_text: Optional[str]
     human_feedback: Optional[str]
     status: Optional[str]
     is_fallback: Optional[bool]
     server_recovered: Optional[bool]
-
-from src.core.analyzer_node import analyzer_node
 
 # 2. Define Nodes
 from src.core.gemini_node import (
@@ -206,10 +201,7 @@ def process_incoming_message(state: AgentState):
         return {
             "draft_text": draft,
             "status": "pending",
-            "is_fallback": res.get("is_fallback", False),
-            "vibe": res.get("vibe", state.get("vibe")),
-            "standalone_search_query": state.get("standalone_search_query"),
-            "rag_context": res.get("rag_context", state.get("rag_context"))
+            "is_fallback": False
         }
     except Exception as e:
         err_str = str(e).lower()
@@ -514,7 +506,6 @@ def route_after_human(state: AgentState):
 # 4. Build StateGraph
 builder = StateGraph(AgentState)
 
-builder.add_node("analyzer_node", analyzer_node)
 builder.add_node("gemini_proxy_node", process_incoming_message)
 builder.add_node("send_to_telegram", send_to_telegram)
 builder.add_node("wait_for_human_action", wait_for_human_action)
@@ -522,8 +513,7 @@ builder.add_node("process_human_feedback", process_human_feedback)
 builder.add_node("dispatch_message", dispatch_message)
 
 # Define edges
-builder.add_edge(START, "analyzer_node")
-builder.add_edge("analyzer_node", "gemini_proxy_node")
+builder.add_edge(START, "gemini_proxy_node")
 builder.add_conditional_edges("gemini_proxy_node", route_after_generation)
 builder.add_edge("send_to_telegram", "wait_for_human_action")
 builder.add_edge("process_human_feedback", "send_to_telegram") # Loop back to telegram after editing

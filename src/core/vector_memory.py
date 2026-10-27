@@ -240,50 +240,6 @@ def retrieve_relevant_facts(query: str, k: int = 3) -> list[str]:
         print(f"[Vector Memory] Error retrieving relevant facts: {e}")
         return []
 
-class ChromaDBManager:
-    """
-    Manager wrapping ChromaDB collections to expose similarity_search()
-    for contextualized retrieval from Memories.md and relationship facts.
-    """
-    def similarity_search(self, query: str, k: int = 3) -> list[str]:
-        query_clean = query.strip()
-        if not query_clean:
-            return []
-        try:
-            client = get_chroma_client()
-            docs = []
-
-            # 1. Search fact_memory collection (where Memories.md chunks are stored)
-            fact_col = get_fact_memory_collection()
-            if fact_col.count() > 0:
-                n_res = min(k, fact_col.count())
-                results = fact_col.query(query_texts=[query_clean], n_results=n_res)
-                if results and "documents" in results and results["documents"]:
-                    for doc in results["documents"][0]:
-                        if doc and doc.strip() and doc.strip() not in docs:
-                            docs.append(doc.strip())
-
-            # 2. Search chat_history collection if more documents are needed
-            if len(docs) < k:
-                try:
-                    chat_col = client.get_collection(name="chat_history")
-                    if chat_col.count() > 0:
-                        n_res = min(k, chat_col.count())
-                        results = chat_col.query(query_texts=[query_clean], n_results=n_res)
-                        if results and "documents" in results and results["documents"]:
-                            for doc in results["documents"][0]:
-                                if doc and doc.strip() and doc.strip() not in docs:
-                                    docs.append(doc.strip())
-                except Exception:
-                    pass
-
-            return docs[:k]
-        except Exception as e:
-            print(f"[ChromaDB] Error in similarity_search: {e}")
-            return []
-
-chroma_db = ChromaDBManager()
-
 def _group_bubbles_into_bursts(messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
     """
     Groups consecutive messages from the same speaker into a single multi-line burst.
