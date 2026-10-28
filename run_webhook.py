@@ -20,7 +20,10 @@ def main():
     enable_ngrok = os.environ.get("ENABLE_NGROK", "True").lower() in ("true", "1", "yes") and bool(ngrok_token)
     if enable_ngrok:
         try:
-            ngrok.set_auth_token(ngrok_token)
+            try:
+                ngrok.set_auth_token(ngrok_token)
+            except Exception:
+                pass
             # Start ngrok tunnel pointing to dynamic port
             public_url = ngrok.connect(port).public_url
             print("\n" + "="*60)

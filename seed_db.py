@@ -36,6 +36,13 @@ def main():
     from scripts.inject_core_facts import inject_memories
     inject_memories()
 
+    # 5. Restore learned style corrections into SQLite feedback_log
+    print("\n--------------------------------------------------")
+    print("🧠 Restoring Learned Style Corrections (feedback_log)...")
+    print("--------------------------------------------------")
+    from scripts.restore_feedback import restore_feedback
+    restore_feedback()
+
     print("\n✅ All databases seeded successfully!")
 
 if __name__ == "__main__":
