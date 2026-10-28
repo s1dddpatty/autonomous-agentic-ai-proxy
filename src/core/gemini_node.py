@@ -162,18 +162,17 @@ def build_quota_exhausted_draft(error_msg: str = "") -> str:
         "muahh i love youuu ❤️💖🫶🏻💕"
     )
 
-# Model initialization strictly reads:
-# google.generativeai.GenerativeModel("gemini-1.5-flash-8b")
-MODEL_NAME = "gemini-1.5-flash-8b"
+# Model initialization strictly reads active model tier:
+MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-flash-lite-latest")
 ACTIVE_FALLBACK_MODEL = "gemini-flash-lite-latest"
-REQUEST_TIMEOUT_SECONDS = 8.0
+REQUEST_TIMEOUT_SECONDS = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "25.0"))
 _active_key_index = 0
 
 def _create_genai_client(api_key: str):
     try:
         return genai.Client(
             api_key=api_key,
-            http_options=types.HttpOptions(timeout=10000)
+            http_options=types.HttpOptions(timeout=30000)
         )
     except TypeError:
         return genai.Client(api_key=api_key)
@@ -417,20 +416,51 @@ def gemini_proxy_node(state: dict) -> dict:
     current_time_str = now.strftime("%A, %Y-%m-%d %I:%M %p")
     
     incoming_text = state.get("incoming_text", "")
+    target_name = os.getenv("TARGET_CONTACT_NAME", "PersonName")
     
-    # 2. Retrieve Semantic JIT Facts (Top 3 relevant facts)
-    recalled_facts = retrieve_relevant_facts(incoming_text, k=3)
+    # 2. Extract recent history from State & SQLite first for multi-turn context
+    messages_history = state.get("messages", [])
+    if not messages_history:
+        messages_history = get_recent_history(limit=20)
+        
+    history_lines = []
+    for msg in messages_history:
+        role_name = "Siddharth" if msg.get("role") in ["Siddharth", "ai", "model", "gpt"] else target_name
+        content = msg.get("content", "").strip()
+        if content:
+            history_lines.append(f"{role_name}: {content}")
+            
+    history_str = "\n".join(history_lines) if history_lines else "No prior history recorded."
+
+    # 3. Context-Aware Query for Semantic JIT Facts:
+    # If the incoming text is a short follow-up or pronoun query (e.g., "bata then kab?", "boll na"),
+    # combine with the last partner message to create a rich semantic search query.
+    fact_query = incoming_text.strip()
+    if messages_history:
+        partner_msgs = [
+            m.get("content", "").strip()
+            for m in messages_history
+            if m.get("role") not in ["Siddharth", "ai", "model", "gpt"] and m.get("content")
+        ]
+        if partner_msgs:
+            last_partner_msg = partner_msgs[-1]
+            short_triggers = ["kab", "then", "bata", "kaha", "boll", "bol", "when", "where", "date", "pehle", "aur", "which", "kiske", "kisne"]
+            is_followup = len(fact_query.split()) <= 4 or any(trig in fact_query.lower() for trig in short_triggers)
+            if is_followup and last_partner_msg != fact_query:
+                fact_query = f"{last_partner_msg} {fact_query}"
+
+    recalled_facts = retrieve_relevant_facts(fact_query, k=5)
     
-    # 3. Retrieve Dual RAG Context (Style Bursts + Episodic Memories)
+    # 4. Retrieve Dual RAG Context (Style Bursts + Episodic Memories)
     dual_context = retrieve_dual_context(incoming_text, n_style=10, n_memory=10)
     detected_mood = dual_context.get("detected_mood", "casual")
     detected_stage = dual_context.get("detected_stage", "ongoing")
     style_chunks = dual_context.get("style_chunks", "")
     memory_chunks = dual_context.get("memory_chunks", "")
     
-    print(f"[Gemini Node] Incoming: '{incoming_text}' | Vibe: mood='{detected_mood}', stage='{detected_stage}'")
+    print(f"[Gemini Node] Incoming: '{incoming_text}' | Fact Query: '{fact_query}' | Stage: '{detected_stage}'")
     
-    # 4. Load Custom Guardrails & Learned Feedback
+    # 5. Load Custom Guardrails & Learned Feedback
     custom_guardrails_str = load_guardrails()
     
     recent_feedback = get_recent_feedback(limit=5)
@@ -444,29 +474,13 @@ def gemini_proxy_node(state: dict) -> dict:
                 f"Resulting Rule: I must output \"{item['revised']}\""
             )
         learned_corrections_str = "\n<LEARNED_STYLE_CORRECTIONS>\n" + "\n\n".join(corrections) + "\n</LEARNED_STYLE_CORRECTIONS>\n"
-
-    target_name = os.getenv("TARGET_CONTACT_NAME", "PersonName")
-
-    # 5. Extract input and history from State & SQLite
-    messages_history = state.get("messages", [])
-    if not messages_history:
-        messages_history = get_recent_history(limit=20)
-        
-    history_lines = []
-    for msg in messages_history:
-        role_name = "Siddharth" if msg.get("role") in ["Siddharth", "ai", "model", "gpt"] else target_name
-        content = msg.get("content", "").strip()
-        if content:
-            history_lines.append(f"{role_name}: {content}")
-            
-    history_str = "\n".join(history_lines) if history_lines else "No prior history recorded."
     
     # 6. Build Mega-Prompt with 4-Step Brain Architecture
     system_instruction = f"""You are Siddharth, a 21-year-old B.Tech student at SPIT in Mumbai. 
 You are texting your girlfriend {target_name} on WhatsApp.
 
 [CURRENT DATE & TIME]: {current_time_str}
-[DETECTED VIBE]: Conversation Stage = "{detected_stage.upper()}", Mood = "{detected_mood.upper()}"
+[CONVERSATION STAGE]: {detected_stage.upper()}
 {custom_guardrails_str}
 {learned_corrections_str}
 
@@ -478,13 +492,15 @@ Step 1 (Stage & Intent Check):
 - ONLY initiate closing/goodnight sequences if she is explicitly closing the conversation (e.g., saying goodnight, sleeping, bye).
 - MULTI-POINT CONTEXT AWARENESS: When {target_name} sends multiple lines or distinct statements in a burst, do not ignore earlier statements just to answer the last line. Acknowledge her thoughts naturally, but do not feel obligated to mirror her exact message count.
 
-Step 2 (Mood & Tone Calibration):
-- Current detected mood: "{detected_mood}"
-- Calibrate your emotional warmth, slang, and emoji usage to match her emotional vibe:
+Step 2 (Mood & Emotional Tone Calibration):
+- Evaluate her actual emotional tone dynamically from the recent conversation flow and context.
+- Distinguish between playful teasing / memory testing vs. genuine distress or conflict:
+  * Do NOT assume multiple question marks (???) or exclamation marks mean she is angry or upset unless her words explicitly express sadness, frustration, or hurt.
+  * If she is playfully quizzing you, asking about memories, or teasing, match her energy with warm, relaxed banter—never panic, become overly formal, or issue unneeded apologies.
   * "affectionate": warm, loving, sweet emojis (😴, ✨️, 💖, 🫶)
   * "playful": light teasing, funny Hinglish banter, laughing emojis (😂, 😭), shorthand ("lmao", "pagal")
   * "sarcastic": match the dry banter and irony smoothly, never be dismissive or rude
-  * "serious_upset": drop all sarcasm, jokes, and shorthand; provide genuine reassurance, attentiveness, and mature comfort
+  * "serious_upset": ONLY if she is genuinely upset or expressing real hurt, drop all sarcasm and jokes; provide mature reassurance and comfort.
   * "casual": relaxed, chill, everyday conversational Hinglish ("ha", "thik", "wbu", "nw")
 
 Step 3 (Top-10 Pattern Synthesis vs. Copy-Pasting & Message Segmentation):
@@ -501,8 +517,10 @@ When responding to a multi-line burst from {target_name}, DO NOT automatically r
 - Do NOT feel obligated to match her message count. Often, a single well-crafted text is more natural than firing back 4 separate texts just because she sent 4.
 - If she sends a wall of text, you can respond with just one short line. Prioritize natural, flowing conversation over strict 1:1 line matching.
 
-Step 4 (Deep Memory & Feedback Override):
-- Use <RECALLED_EPISODIC_MEMORIES> only when relevant to specific past events or facts she references.
+Step 4 (Factual Priority & Anti-Hallucination Grounding):
+- When she asks about a specific past event, date, milestone, or relationship fact:
+  1. Check RELEVANT RECALLED FACTS below first. Any date, place, or fact listed there is the ABSOLUTE TRUTH. Weave the exact date/fact naturally into your reply. Never contradict it, guess, or estimate dates from random chat fragments.
+  2. STRICT NEGATIVE GROUNDING RULE: If she asks about a past date or fact that is NOT explicitly present in RELEVANT RECALLED FACTS or recent chat history, DO NOT guess, invent, or hallucinate dates (such as February 14). Instead, respond naturally in your dry, casual tone and playfully admit you don't remember the exact date/detail (e.g., "are yaar exact date yaad nahi aa rahi, tu bata na 😂" or playfully accuse her of testing your memory).
 - ALWAYS obey <LEARNED_STYLE_CORRECTIONS> and <CUSTOM_GUARDRAILS> as absolute top-priority constraints overriding all other patterns.
 
 FEW-SHOT TEXTING EXAMPLES:
@@ -544,9 +562,9 @@ CRITICAL OUTPUT RULE: Never output your internal checklist, bullet points (* or 
     if recalled_facts:
         facts_lines = "\n".join(f"- {f}" for f in recalled_facts)
         system_instruction += (
-            f"\n\nRELEVANT RECALLED FACTS FOR THIS CONTEXT:\n"
+            f"\n\nRELEVANT RECALLED FACTS FOR THIS CONTEXT (SOURCE OF TRUTH):\n"
             f"{facts_lines}\n"
-            f"(Use these facts naturally in your response if they fit the context, but do not force them. Do not sound like a robot reading a database.)"
+            f"(These facts are 100% accurate. If she is asking about a past milestone or date, state the exact fact/date from here naturally.)"
         )
 
     LIVE_INPUT = f"""<TOP_10_SITUATIONAL_STYLE_BURSTS>

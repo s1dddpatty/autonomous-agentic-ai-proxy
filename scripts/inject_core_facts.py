@@ -1,6 +1,10 @@
 import os
-import chromadb
+import sys
 
+# Ensure repository root is on sys.path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+import chromadb
 from src.core.config import CHROMA_PATH, DATA_DIR, BASE_DIR
 
 # Setup paths
@@ -21,21 +25,44 @@ def inject_memories():
     with open(DATA_FILE, "r", encoding="utf-8") as f:
         content = f.read()
 
-    # Split the markdown file by horizontal rules to create semantic timeline chunks
-    raw_chunks = content.split("---")
-    chunks = [c.strip() for c in raw_chunks if c.strip()]
-
+    # Granular bullet-point parsing: each milestone gets its own vector embedding
+    current_section = "Relationship Timeline"
     documents = []
     ids = []
     metadatas = []
 
-    for i, chunk in enumerate(chunks):
-        documents.append(chunk)
-        ids.append(f"core_memory_timeline_{i}")
-        # Tagging it as a core_fact so it holds semantic weight in retrieval
-        metadatas.append({"source": "Memories.md", "type": "core_fact"})
+    import hashlib
 
-    print(f"Embedding {len(chunks)} core memory chunks into the vector space...")
+    # 1. First, include section-level timeline overviews
+    raw_chunks = content.split("---")
+    for i, chunk in enumerate(raw_chunks):
+        c_clean = chunk.strip()
+        if c_clean:
+            documents.append(c_clean)
+            ids.append(f"core_timeline_overview_{i}")
+            metadatas.append({"source": "Memories.md", "type": "timeline_overview"})
+
+    # 2. Extract every individual bullet-point milestone
+    for line in content.splitlines():
+        line_clean = line.strip()
+        if not line_clean:
+            continue
+        if line_clean.startswith("## "):
+            current_section = line_clean.replace("## ", "").strip()
+            continue
+        if line_clean.startswith("* **") or line_clean.startswith("- **"):
+            fact_body = line_clean.lstrip("*- ").strip()
+            fact_text = f"[{current_section}] {fact_body}"
+            doc_id = hashlib.md5(fact_text.lower().encode("utf-8")).hexdigest()[:12]
+            documents.append(fact_text)
+            ids.append(f"core_fact_{doc_id}")
+            metadatas.append({
+                "source": "Memories.md",
+                "type": "core_fact",
+                "section": current_section
+            })
+
+    print(f"Embedding {len(documents)} granular core memory facts into the vector space...")
     collection.upsert(
         documents=documents,
         ids=ids,
@@ -53,7 +80,7 @@ def inject_memories():
     except Exception as e:
         print(f"Warning syncing with fact_memory: {e}")
 
-    print("✅ Core memories successfully injected into ChromaDB!")
+    print("✅ Granular core memories successfully injected into ChromaDB!")
 
 if __name__ == "__main__":
     inject_memories()

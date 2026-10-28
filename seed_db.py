@@ -29,6 +29,13 @@ def main():
     print("--------------------------------------------------")
     index_chats_to_chroma()
 
+    # 4. Inject fine-grained core facts from Memories.md
+    print("\n--------------------------------------------------")
+    print("💎 Ingesting and Embedding Core Memories (Memories.md)...")
+    print("--------------------------------------------------")
+    from scripts.inject_core_facts import inject_memories
+    inject_memories()
+
     print("\n✅ All databases seeded successfully!")
 
 if __name__ == "__main__":
