@@ -13,26 +13,32 @@ from src.core.memory_manager import add_pending_message, pop_pending_messages
 app = FastAPI()
 
 # -------------------------------------------------------------
-# 10-SECOND STRICT ASYNC DEBOUNCE LOCK FOR MESSAGE BURSTS
+# SLIDING WINDOW ASYNC DEBOUNCE LOCK FOR MESSAGE BURSTS
 # -------------------------------------------------------------
-DEBOUNCE_SECONDS = 10.0
+DEBOUNCE_SECONDS = float(os.getenv("DEBOUNCE_SECONDS", "7.0"))
 ACTIVE_TIMERS: Dict[str, asyncio.Task] = {}
 
 async def debounce_and_dispatch(chat_id: str):
     """
-    Waits exactly 10.0 seconds for the user to finish typing.
-    Once the 10-second sleep finishes:
-    1. Strictly removes chat_id from ACTIVE_TIMERS.
+    Sliding window debounce timer.
+    Waits for DEBOUNCE_SECONDS of silence after the most recent message.
+    If a follow-up message arrives while sleeping, this task is cancelled and rescheduled.
+    Once DEBOUNCE_SECONDS of silence elapses without new messages:
+    1. Removes chat_id from ACTIVE_TIMERS.
     2. Pulls all pending messages for that chat_id from the SQLite buffer.
     3. Concatenates them into a single string (joined_text = "\n".join(messages)).
-    4. Passes this single joined_text block to the Gemini node via handle_incoming_whatsapp_burst.
+    4. Passes the unified burst block to handle_incoming_whatsapp_burst.
     """
     try:
         await asyncio.sleep(DEBOUNCE_SECONDS)
     except asyncio.CancelledError:
+        # Cancelled because a follow-up message arrived before silence duration elapsed
         return
     finally:
-        ACTIVE_TIMERS.pop(chat_id, None)
+        current_task = asyncio.current_task()
+        # Only remove if this task is still the registered active timer (prevent cancelling task from wiping a newer task)
+        if ACTIVE_TIMERS.get(chat_id) == current_task:
+            ACTIVE_TIMERS.pop(chat_id, None)
 
     # Pull all pending messages for that chat_id from the SQLite buffer
     messages = pop_pending_messages(chat_id)
@@ -41,7 +47,7 @@ async def debounce_and_dispatch(chat_id: str):
 
     # Concatenate them into a single string
     joined_text = "\n".join(messages)
-    print(f"[Debounce Lock] ⚡ Debounce elapsed (10.0s). Flushed {len(messages)} message(s) for {chat_id}:\n{joined_text}")
+    print(f"[Debounce Lock] ⚡ Sliding debounce elapsed ({DEBOUNCE_SECONDS}s silence). Flushed {len(messages)} message(s) for {chat_id}:\n{joined_text}")
 
     from src.core.orchestrator import handle_incoming_whatsapp_burst
     # Pass this single joined_text block to Gemini so it processes the entire burst as one prompt
@@ -88,15 +94,16 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                         # 1. Instantly save to SQLite pending buffer
                         add_pending_message(chat_id, text)
                         
-                        # 2. Check if an asyncio task is already running in ACTIVE_TIMERS for that specific chat_id
+                        # 2. Sliding window debounce: cancel active timer so timer resets from latest message
                         existing_timer = ACTIVE_TIMERS.get(chat_id)
                         if existing_timer and not existing_timer.done():
-                            # If YES: Do nothing. The message is safely in the database and the existing timer will grab it.
-                            print(f"[Debounce Lock] 🔒 Active timer running for {chat_id}. Message buffered in SQLite.")
+                            existing_timer.cancel()
+                            print(f"[Debounce Lock] 🔄 Follow-up received for {chat_id}. Sliding timer reset ({DEBOUNCE_SECONDS}s).")
                         else:
-                            # If NO: Spawn a new async background task that sleeps for exactly 10.0 seconds
-                            print(f"[Debounce Lock] ⏱️ Spawning 10.0s debounce timer task for {chat_id}.")
-                            ACTIVE_TIMERS[chat_id] = asyncio.create_task(debounce_and_dispatch(chat_id))
+                            print(f"[Debounce Lock] ⏱️ New burst started for {chat_id}. Timer set ({DEBOUNCE_SECONDS}s).")
+
+                        # 3. Schedule fresh sliding countdown task
+                        ACTIVE_TIMERS[chat_id] = asyncio.create_task(debounce_and_dispatch(chat_id))
                     
     except IndexError:
         pass

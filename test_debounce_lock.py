@@ -70,6 +70,53 @@ async def test_debounce_lock_concurrency(monkeypatch):
 
         print("✅ test_debounce_lock_concurrency & second burst passed")
 
+async def test_sliding_window_debounce(monkeypatch):
+    chat_id = "test_user_777"
+    clear_pending_messages(chat_id)
+    ACTIVE_TIMERS.clear()
+
+    invocations = []
+    def mock_burst(sender, joined, lines):
+        invocations.append((sender, joined, lines))
+
+    import src.core.orchestrator
+    monkeypatch.setattr(src.core.orchestrator, "handle_incoming_whatsapp_burst", mock_burst)
+    # Set debounce window to 0.4 seconds of silence
+    monkeypatch.setattr("src.gateways.whatsapp_webhook.DEBOUNCE_SECONDS", 0.4)
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # Msg 1 at t = 0
+        await client.post("/webhook", json={
+            "entry": [{"changes": [{"value": {"messages": [{"from": chat_id, "type": "text", "text": {"body": "Msg 1"}}]}}]}]
+        })
+        # Wait 0.25s (< 0.4s)
+        await asyncio.sleep(0.25)
+        assert len(invocations) == 0, "Timer should not have fired yet"
+
+        # Msg 2 at t = 0.25s (resets timer for another 0.4s -> expires at 0.65s)
+        await client.post("/webhook", json={
+            "entry": [{"changes": [{"value": {"messages": [{"from": chat_id, "type": "text", "text": {"body": "Msg 2"}}]}}]}]
+        })
+        # Wait 0.25s (total t = 0.50s. Under old fixed timer, it would have cut off at 0.4s!)
+        await asyncio.sleep(0.25)
+        assert len(invocations) == 0, "Timer should have slid and NOT fired at 0.50s"
+
+        # Msg 3 at t = 0.50s (resets timer for another 0.4s -> expires at 0.90s)
+        await client.post("/webhook", json={
+            "entry": [{"changes": [{"value": {"messages": [{"from": chat_id, "type": "text", "text": {"body": "Msg 3"}}]}}]}]
+        })
+        # Wait 0.25s (total t = 0.75s)
+        await asyncio.sleep(0.25)
+        assert len(invocations) == 0, "Timer should have slid again and NOT fired at 0.75s"
+
+        # Now wait for the silence window to complete (0.25s more -> total t = 1.00s > 0.90s)
+        await asyncio.sleep(0.30)
+        assert len(invocations) == 1, f"Expected 1 unified burst, got {len(invocations)}"
+        assert invocations[0][1] == "Msg 1\nMsg 2\nMsg 3"
+        assert chat_id not in ACTIVE_TIMERS
+        print("✅ test_sliding_window_debounce passed! Rapid messages kept resetting timer into 1 batch.")
+
 if __name__ == "__main__":
     asyncio.run(test_sqlite_pending_buffer())
     class DummyMonkeyPatch:
@@ -81,5 +128,7 @@ if __name__ == "__main__":
                 setattr(mod, parts[1], name_or_val)
             else:
                 setattr(target, name_or_val, val)
-    asyncio.run(test_debounce_lock_concurrency(DummyMonkeyPatch()))
+    patcher = DummyMonkeyPatch()
+    asyncio.run(test_debounce_lock_concurrency(patcher))
+    asyncio.run(test_sliding_window_debounce(patcher))
     print("All tests completed successfully!")
