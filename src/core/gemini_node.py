@@ -411,8 +411,12 @@ def gemini_proxy_node(state: dict) -> dict:
     LangGraph node to generate WhatsApp responses using Gemini 3 Flash Preview
     with Mood-Aware Trigger -> Burst Dual RAG context and 4-Step Brain Reasoning.
     """
-    # 1. Dynamically fetch the current time for grounding
-    now = datetime.now()
+    # 1. Dynamically fetch the current time for grounding in Indian Standard Time (or configured timezone)
+    from src.core.config import APP_TIMEZONE
+    try:
+        now = datetime.now(ZoneInfo(APP_TIMEZONE))
+    except Exception:
+        now = datetime.now(ZoneInfo("Asia/Kolkata"))
     current_time_str = now.strftime("%A, %Y-%m-%d %I:%M %p")
     
     incoming_text = state.get("incoming_text", "")

@@ -65,6 +65,9 @@ TARGET_CONTACT_NAME: str = (
 ).strip().strip("'\"")
 TARGET_NAME: str = TARGET_CONTACT_NAME
 
+# --- TIMEZONE CONFIGURATION ---
+APP_TIMEZONE: str = os.getenv("APP_TIMEZONE", "Asia/Kolkata").strip().strip("'\"")
+
 # --- WHATSAPP CONFIGURATION ---
 WHATSAPP_ACCESS_TOKEN: str = (
     os.getenv("WHATSAPP_ACCESS_TOKEN") or os.getenv("WHATSAPP_TOKEN") or ""
