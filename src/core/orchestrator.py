@@ -270,7 +270,9 @@ def send_to_telegram(state: AgentState):
     
     print(f"[Telegram Dispatch] Preparing approval card for thread {thread_id} (is_fallback={is_fallback}, server_recovered={server_recovered})...")
     
-    sender_header = f"📩 Incoming from: {sender_id}" if sender_id else "📩 Incoming WhatsApp Message"
+    from src.core.config import get_contact_display_name
+    sender_display = get_contact_display_name(sender_id) if sender_id else "Unknown Contact"
+    sender_header = f"📩 Incoming from: {sender_display}"
     if is_fallback:
         if "[GENERATION FAILED]" in str(draft):
             text = (

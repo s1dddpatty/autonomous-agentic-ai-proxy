@@ -70,7 +70,8 @@ def create_card(incoming_text: str, draft_text: str, thread_id: str, sender_id: 
     Builds the card text and inline keyboard depending on whether is_fallback or normal/recovered.
     Explicitly displays the sender's identity in the header: 📩 Incoming from: [Sender Phone Number].
     """
-    sender_label = sender_id or TARGET_PHONE or TARGET_NAME
+    from src.core.config import get_contact_display_name
+    sender_label = get_contact_display_name(sender_id or TARGET_PHONE or TARGET_NAME)
     if is_fallback:
         text = format_fallback_card(incoming_text, draft_text, sender_id=sender_label)
         keyboard = get_fallback_keyboard(thread_id)

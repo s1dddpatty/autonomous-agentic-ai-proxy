@@ -1,10 +1,11 @@
 import requests
 from typing import Optional
-from src.core.config import WHATSAPP_ACCESS_TOKEN, WHATSAPP_PHONE_ID
+from src.core.config import WHATSAPP_ACCESS_TOKEN, WHATSAPP_PHONE_ID, get_whatsapp_token_for_number, get_contact_display_name, TARGET_PHONE_NUMBER
 
 def send_whatsapp_message(to_number: str, text: str = ""):
     recipient = str(to_number).strip() if to_number else ""
-    if not WHATSAPP_ACCESS_TOKEN or not WHATSAPP_PHONE_ID:
+    token = get_whatsapp_token_for_number(recipient) or WHATSAPP_ACCESS_TOKEN
+    if not token or not WHATSAPP_PHONE_ID:
         print("Error: Missing WhatsApp tokens in configuration.")
         return None
 
@@ -14,7 +15,7 @@ def send_whatsapp_message(to_number: str, text: str = ""):
 
     url = f"https://graph.facebook.com/v19.0/{WHATSAPP_PHONE_ID}/messages"
     headers = {
-        "Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}",
+        "Authorization": f"Bearer {token}",
         "Content-Type": "application/json"
     }
     
