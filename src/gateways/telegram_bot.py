@@ -44,11 +44,13 @@ def get_approval_keyboard(thread_id: str):
     ]
     return InlineKeyboardMarkup(keyboard)
 
-def format_fallback_card(incoming_text: str, draft_text: str) -> str:
+def format_fallback_card(incoming_text: str, draft_text: str, sender_id: str = "") -> str:
     """Formats the Telegram approval card when Gemini API is offline."""
+    sender_header = f"📩 Incoming from: {sender_id}\n\n" if sender_id else ""
     return (
         "⚠️ [API OFFLINE] Google Servers Down.\n\n"
-        f"📩 Incoming: \"{incoming_text}\"\n\n"
+        f"{sender_header}"
+        f"Text:\n\"{incoming_text}\"\n\n"
         f"🤖 Proposed Stall (Local): \"{draft_text}\"\n\n"
         "(A background worker is polling the API and will notify you when it recovers.)"
     )
@@ -63,24 +65,26 @@ def get_fallback_keyboard(target_id: str):
     ]
     return InlineKeyboardMarkup(keyboard)
 
-def create_card(incoming_text: str, draft_text: str, thread_id: str, is_fallback: bool = False, server_recovered: bool = False, is_revision: bool = False):
+def create_card(incoming_text: str, draft_text: str, thread_id: str, sender_id: str = "", is_fallback: bool = False, server_recovered: bool = False, is_revision: bool = False):
     """
     Builds the card text and inline keyboard depending on whether is_fallback or normal/recovered.
+    Explicitly displays the sender's identity in the header: 📩 Incoming from: [Sender Phone Number].
     """
+    sender_label = sender_id or TARGET_PHONE or TARGET_NAME
     if is_fallback:
-        text = format_fallback_card(incoming_text, draft_text)
+        text = format_fallback_card(incoming_text, draft_text, sender_id=sender_label)
         keyboard = get_fallback_keyboard(thread_id)
     else:
+        sender_header = f"📩 Incoming from: {sender_label}"
         if server_recovered:
-            header = "🟢 [SERVER RECOVERED]"
+            header = f"🟢 [SERVER RECOVERED]\n{sender_header}"
         elif is_revision:
-            header = "🔄 Revised AI Draft"
+            header = f"🔄 Revised AI Draft\n{sender_header}"
         else:
-            header = "📩 Incoming WhatsApp Message"
+            header = sender_header
             
         text = (
             f"{header}\n\n"
-            f"From: {TARGET_NAME}\n"
             f"Text:\n\"{incoming_text}\"\n\n"
             "🤖 Proposed AI Draft:\n"
             f"\"{draft_text}\""
@@ -93,7 +97,7 @@ async def simulate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
         
     thread_id = str(uuid.uuid4())[:8]
-    sender_id = TARGET_NAME
+    sender_id = TARGET_PHONE or TARGET_NAME
     incoming_text = "how is your day going? milo just knocked over another plant 😭"
     
     await update.message.reply_text(f"Starting simulation. Thread ID: {thread_id}")
@@ -103,7 +107,7 @@ async def simulate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     draft = state.get("draft_text", "")
     is_fallback = bool(state.get("is_fallback"))
-    text, keyboard = create_card(incoming_text, draft, thread_id, is_fallback=is_fallback)
+    text, keyboard = create_card(incoming_text, draft, thread_id, sender_id=sender_id, is_fallback=is_fallback)
     
     await update.message.reply_text(text, reply_markup=keyboard)
 
@@ -143,16 +147,24 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         current_draft = card.get("draft_text", "") if card else ""
         incoming_text = card.get("incoming_text", "") if card else ""
+        sender_id = card.get("sender_id", "") if card else ""
         
         # Fallback if card wasn't found in DB: extract from current message text
-        if not incoming_text and query.message.text:
-            m = re.search(r'📩 Incoming:\s*"([^"]+)"', query.message.text)
-            if m:
-                incoming_text = m.group(1)
-        if not current_draft and query.message.text:
-            m = re.search(r'🤖 Proposed Stall \(Local\):\s*"([^"]+)"', query.message.text)
-            if m:
-                current_draft = m.group(1)
+        if query.message.text:
+            if not incoming_text:
+                m = re.search(r'Text:\s*\n?"([^"]+)"', query.message.text)
+                if not m:
+                    m = re.search(r'📩 Incoming(?:\s*from:[^\n]+)?:\s*"([^"]+)"', query.message.text)
+                if m:
+                    incoming_text = m.group(1)
+            if not current_draft:
+                m = re.search(r'🤖 Proposed Stall \(Local\):\s*"([^"]+)"', query.message.text)
+                if m:
+                    current_draft = m.group(1)
+            if not sender_id:
+                m_sender = re.search(r'📩 Incoming from:\s*([^\n]+)', query.message.text)
+                if m_sender:
+                    sender_id = m_sender.group(1).strip()
 
         target_lower = TARGET_NAME.lower()
         err_type = 429 if (f"sorryy {target_lower}" in current_draft or "sorryy aarushii" in current_draft or "rest now" in current_draft or "13 hours" in current_draft) else 503
@@ -162,7 +174,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if card:
             update_pending_card_draft(card["telegram_message_id"], new_draft)
         
-        new_text = format_fallback_card(incoming_text, new_draft)
+        new_text = format_fallback_card(incoming_text, new_draft, sender_id=sender_id)
         fallback_kb = get_fallback_keyboard(effective_thread)
         
         try:

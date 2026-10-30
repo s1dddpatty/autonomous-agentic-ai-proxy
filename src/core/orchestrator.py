@@ -270,11 +270,13 @@ def send_to_telegram(state: AgentState):
     
     print(f"[Telegram Dispatch] Preparing approval card for thread {thread_id} (is_fallback={is_fallback}, server_recovered={server_recovered})...")
     
+    sender_header = f"📩 Incoming from: {sender_id}" if sender_id else "📩 Incoming WhatsApp Message"
     if is_fallback:
         if "[GENERATION FAILED]" in str(draft):
             text = (
                 "❌ [GENERATION FAILED]\n\n"
-                f"📩 Incoming: \"{incoming}\"\n\n"
+                f"{sender_header}\n\n"
+                f"Text:\n\"{incoming}\"\n\n"
                 f"⚠️ Error: {draft}\n\n"
                 "(The background generator encountered an error or empty model response.)"
             )
@@ -288,7 +290,8 @@ def send_to_telegram(state: AgentState):
         else:
             text = (
                 "⚠️ [API OFFLINE] Google Servers Down.\n\n"
-                f"📩 Incoming: \"{incoming}\"\n\n"
+                f"{sender_header}\n\n"
+                f"Text:\n\"{incoming}\"\n\n"
                 f"🤖 Proposed Stall (Local): \"{draft}\"\n\n"
                 "(A background worker is polling the API and will notify you when it recovers.)"
             )
@@ -302,15 +305,14 @@ def send_to_telegram(state: AgentState):
             }
     else:
         if server_recovered:
-            header = "🟢 [SERVER RECOVERED] Fresh AI Draft"
+            header = f"🟢 [SERVER RECOVERED]\n{sender_header}"
         elif is_revision:
-            header = "🔄 Revised AI Draft"
+            header = f"🔄 Revised AI Draft\n{sender_header}"
         else:
-            header = "📩 Incoming WhatsApp Message"
+            header = sender_header
             
         text = (
-            f"{header}\n"
-            f"From: {sender_id}\n"
+            f"{header}\n\n"
             f"Text:\n\"{incoming}\"\n\n"
             "🤖 Proposed AI Draft:\n"
             f"\"{draft}\""
@@ -439,15 +441,23 @@ def dispatch_message(state: AgentState):
         card = get_pending_card_by_thread(thread_id)
         if card:
             final_draft = card.get("draft_text", "")
-            if not sender_id:
-                sender_id = card.get("sender_id")
-    
+    # If sender_id is missing, try retrieving from pending card
+    if not sender_id and thread_id:
+        card = get_pending_card_by_thread(thread_id)
+        if card:
+            sender_id = card.get("sender_id")
+
+    # CRITICAL SAFETY GUARD: Ensure dynamic recipient number is present
+    if not sender_id:
+        print(f"[Orchestrator] BLOCKED DISPATCH: Missing dynamic destination phone number (sender_id={sender_id}).")
+        return {"status": "error_missing_recipient"}
+
     # CRITICAL SAFETY GUARD: Never dispatch empty or error drafts to WhatsApp
     if not final_draft or final_draft.startswith("⚠️ [GEMINI ERROR:"):
         print(f"[Orchestrator] BLOCKED DISPATCH: Draft is empty or error message: '{final_draft}'")
         return {"status": "error_blocked"}
 
-    print(f"[Orchestrator] Dispatching message to {sender_id} (mode={mode})")
+    print(f"[Orchestrator] Dispatching message dynamically to {sender_id} (mode={mode})")
     
     # Split by newline (ignoring empty lines) to dispatch sequential bubbles
     bubbles = [line.strip() for line in final_draft.split("\n") if line.strip()]

@@ -76,37 +76,36 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
     
     # Safely inspect the payload for incoming messages
     try:
-        entry = body.get("entry", [])[0]
-        changes = entry.get("changes", [])[0]
-        value = changes.get("value", {})
-        
-        # Skip read/delivery status updates (they contain "statuses" instead of "messages")
-        if "messages" in value:
-            for message in value.get("messages", []):
-                sender_id = message.get("from")
+        entries = body.get("entry", [])
+        for entry in entries:
+            for change in entry.get("changes", []):
+                value = change.get("value", {})
                 
-                if message.get("type") == "text":
-                    text = message.get("text", {}).get("body")
-                    if text and sender_id:
-                        chat_id = str(sender_id)
-                        print(f"[Webhook Received] From {chat_id}: {text}")
+                # Skip read/delivery status updates (they contain "statuses" instead of "messages")
+                if "messages" in value:
+                    for message in value.get("messages", []):
+                        sender_id = message.get("from")
                         
-                        # 1. Instantly save to SQLite pending buffer
-                        add_pending_message(chat_id, text)
-                        
-                        # 2. Sliding window debounce: cancel active timer so timer resets from latest message
-                        existing_timer = ACTIVE_TIMERS.get(chat_id)
-                        if existing_timer and not existing_timer.done():
-                            existing_timer.cancel()
-                            print(f"[Debounce Lock] 🔄 Follow-up received for {chat_id}. Sliding timer reset ({DEBOUNCE_SECONDS}s).")
-                        else:
-                            print(f"[Debounce Lock] ⏱️ New burst started for {chat_id}. Timer set ({DEBOUNCE_SECONDS}s).")
+                        if message.get("type") == "text":
+                            text = message.get("text", {}).get("body")
+                            if text and sender_id:
+                                chat_id = str(sender_id).strip()
+                                print(f"[Webhook Received] Dynamic routing from {chat_id}: {text}")
+                                
+                                # 1. Instantly save to SQLite pending buffer for this sender
+                                add_pending_message(chat_id, text)
+                                
+                                # 2. Sliding window debounce: cancel active timer so timer resets from latest message
+                                existing_timer = ACTIVE_TIMERS.get(chat_id)
+                                if existing_timer and not existing_timer.done():
+                                    existing_timer.cancel()
+                                    print(f"[Debounce Lock] 🔄 Follow-up received for {chat_id}. Sliding timer reset ({DEBOUNCE_SECONDS}s).")
+                                else:
+                                    print(f"[Debounce Lock] ⏱️ New burst started for {chat_id}. Timer set ({DEBOUNCE_SECONDS}s).")
 
-                        # 3. Schedule fresh sliding countdown task
-                        ACTIVE_TIMERS[chat_id] = asyncio.create_task(debounce_and_dispatch(chat_id))
-                    
-    except IndexError:
-        pass
+                                # 3. Schedule fresh sliding countdown task for this sender
+                                ACTIVE_TIMERS[chat_id] = asyncio.create_task(debounce_and_dispatch(chat_id))
+                            
     except Exception as e:
         print(f"Error parsing webhook: {e}")
 

@@ -1,15 +1,15 @@
 import requests
 from typing import Optional
-from src.core.config import WHATSAPP_ACCESS_TOKEN, WHATSAPP_PHONE_ID, TARGET_PHONE_NUMBER
+from src.core.config import WHATSAPP_ACCESS_TOKEN, WHATSAPP_PHONE_ID
 
-def send_whatsapp_message(to_number: Optional[str] = None, text: str = ""):
-    recipient = to_number or TARGET_PHONE_NUMBER
+def send_whatsapp_message(to_number: str, text: str = ""):
+    recipient = str(to_number).strip() if to_number else ""
     if not WHATSAPP_ACCESS_TOKEN or not WHATSAPP_PHONE_ID:
         print("Error: Missing WhatsApp tokens in configuration.")
         return None
 
     if not recipient:
-        print("Error: No recipient phone number provided or configured.")
+        print("Error: No dynamic recipient phone number provided for outbound WhatsApp message.")
         return None
 
     url = f"https://graph.facebook.com/v19.0/{WHATSAPP_PHONE_ID}/messages"
