@@ -466,8 +466,12 @@ def dispatch_message(state: AgentState):
     if not bubbles and final_draft.strip():
         bubbles = [final_draft.strip()]
 
+    dispatch_success = True
     for i, bubble in enumerate(bubbles):
-        send_whatsapp_message(sender_id, bubble)
+        res = send_whatsapp_message(sender_id, bubble)
+        if res is None:
+            dispatch_success = False
+            print(f"[Orchestrator] ⚠️ Outbound WhatsApp dispatch failed for recipient {sender_id}. Check token validity & recipient verification.")
         if i < len(bubbles) - 1:
             time.sleep(0.4)
     
