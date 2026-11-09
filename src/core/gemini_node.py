@@ -163,8 +163,8 @@ def build_quota_exhausted_draft(error_msg: str = "") -> str:
     )
 
 # Model initialization strictly reads active model tier:
-MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
-ACTIVE_FALLBACK_MODEL = "gemini-2.0-flash"
+MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+ACTIVE_FALLBACK_MODEL = "gemini-3.5-flash-lite"
 REQUEST_TIMEOUT_SECONDS = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "25.0"))
 _active_key_index = 0
 
@@ -180,7 +180,7 @@ def _create_genai_client(api_key: str):
 def _call_model_with_timeout(client, model: str, contents, config=None, request_options=None):
     """
     Calls the Gemini API with fail-fast timeout and multi-tier model fallback
-    (primary -> gemini-2.0-flash -> gemini-1.5-flash), with automatic recovery
+    (primary -> gemini-3.5-flash -> gemini-3.5-flash-lite -> gemini-3.1-flash-lite), with automatic recovery
     if thinking_config returns empty or malformed responses.
     """
     timeout = REQUEST_TIMEOUT_SECONDS
@@ -194,9 +194,9 @@ def _call_model_with_timeout(client, model: str, contents, config=None, request_
         except Exception:
             pass
 
-    # Model fallback cascade: primary model -> gemini-2.0-flash -> gemini-1.5-flash
+    # Model fallback cascade: primary model -> gemini-3.5-flash -> gemini-3.5-flash-lite -> gemini-3.1-flash-lite
     candidate_models = []
-    for m in [model, "gemini-2.0-flash", "gemini-1.5-flash"]:
+    for m in [model, "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]:
         if m and m not in candidate_models:
             candidate_models.append(m)
 
