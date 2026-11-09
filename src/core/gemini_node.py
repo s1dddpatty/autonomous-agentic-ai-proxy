@@ -163,8 +163,8 @@ def build_quota_exhausted_draft(error_msg: str = "") -> str:
     )
 
 # Model initialization strictly reads active model tier:
-MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-flash-lite-latest")
-ACTIVE_FALLBACK_MODEL = "gemini-flash-lite-latest"
+MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+ACTIVE_FALLBACK_MODEL = "gemini-2.0-flash"
 REQUEST_TIMEOUT_SECONDS = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "25.0"))
 _active_key_index = 0
 
@@ -179,11 +179,9 @@ def _create_genai_client(api_key: str):
 
 def _call_model_with_timeout(client, model: str, contents, config=None, request_options=None):
     """
-    Enforces aggressive 8-second fail-fast timeout and model fallback if 1.5-8b is retired.
-    # response = await model.generate_content_async(
-    #     contents=prompt,
-    #     request_options={"timeout": 8.0}
-    # )
+    Calls the Gemini API with fail-fast timeout and multi-tier model fallback
+    (primary -> gemini-2.0-flash -> gemini-1.5-flash), with automatic recovery
+    if thinking_config returns empty or malformed responses.
     """
     timeout = REQUEST_TIMEOUT_SECONDS
     if request_options and "timeout" in request_options:
@@ -196,23 +194,43 @@ def _call_model_with_timeout(client, model: str, contents, config=None, request_
         except Exception:
             pass
 
-    try:
-        return client.models.generate_content(
-            model=model,
-            contents=contents,
-            config=config
-        )
-    except Exception as e:
-        # If gemini-1.5-flash-8b is not found / retired on current API version,
-        # seamlessly fallback to its active successor gemini-flash-lite-latest
-        if "404" in str(e) and "not found" in str(e).lower() and model == "gemini-1.5-flash-8b":
-            print(f"[Gemini Node] Model '{model}' not found. Falling back to active lightweight tier '{ACTIVE_FALLBACK_MODEL}'...")
-            return client.models.generate_content(
-                model=ACTIVE_FALLBACK_MODEL,
-                contents=contents,
-                config=config
-            )
-        raise
+    # Model fallback cascade: primary model -> gemini-2.0-flash -> gemini-1.5-flash
+    candidate_models = []
+    for m in [model, "gemini-2.0-flash", "gemini-1.5-flash"]:
+        if m and m not in candidate_models:
+            candidate_models.append(m)
+
+    last_error = None
+    for target_model in candidate_models:
+        has_thinking = bool(config and getattr(config, "thinking_config", None))
+        thinking_modes = [True, False] if has_thinking else [False]
+
+        for use_thinking in thinking_modes:
+            call_config = config
+            if not use_thinking and has_thinking:
+                import copy
+                try:
+                    call_config = copy.copy(config)
+                    call_config.thinking_config = None
+                except Exception:
+                    call_config = config
+
+            try:
+                response = client.models.generate_content(
+                    model=target_model,
+                    contents=contents,
+                    config=call_config
+                )
+                raw = extract_clean_text(response)
+                if raw and not raw.startswith("Error:"):
+                    return response, target_model
+                print(f"[Gemini Node] Model '{target_model}' (thinking={use_thinking}) returned empty/malformed: '{raw[:60]}'. Trying next fallback...")
+                last_error = Exception(f"Model {target_model} returned empty/malformed response: {raw}")
+            except Exception as e:
+                print(f"[Gemini Node] Model '{target_model}' (thinking={use_thinking}) call failed: {e}. Trying next fallback...")
+                last_error = e
+
+    raise last_error if last_error else Exception(f"All candidate models failed for {model}")
 
 def is_quota_error(e: Exception) -> bool:
     err_lower = str(e).lower()
@@ -243,8 +261,8 @@ def generate_with_key_rotation(contents, config=None) -> str:
     """
     Generates draft responses using GEMINI_KEYS from config.py.
     If ENABLE_KEY_ROTATION is False or only 1 key is provided, disables sleep backoffs
-    and uses the single key directly. Otherwise, rotates across keys on 429 quota exhaustion
-    and performs progressive backoff retries on 503 high demand.
+    and uses the single key directly. Otherwise, rotates across keys on 429 quota exhaustion,
+    503 high demand, or malformed/empty response errors.
     """
     global _active_key_index
     if not GEMINI_KEYS:
@@ -258,7 +276,7 @@ def generate_with_key_rotation(contents, config=None) -> str:
         start_time = time.time()
         try:
             client = _create_genai_client(single_key)
-            response = _call_model_with_timeout(
+            response, used_model = _call_model_with_timeout(
                 client=client,
                 model=MODEL_NAME,
                 contents=contents,
@@ -280,7 +298,9 @@ def generate_with_key_rotation(contents, config=None) -> str:
             )
             raw_draft = extract_clean_text(response)
             draft = sanitize_draft(raw_draft)
-            print(f"[Gemini Node] Successfully generated draft with {MODEL_NAME}: '{draft[:60]}...'")
+            if not draft or draft.startswith("Error:") or draft.startswith("⚠️"):
+                raise Exception(f"Model returned invalid draft: {draft}")
+            print(f"[Gemini Node] Successfully generated draft with {used_model}: '{draft[:60]}...'")
             return draft
         except Exception as e:
             latency_ms = (time.time() - start_time) * 1000
@@ -310,7 +330,7 @@ def generate_with_key_rotation(contents, config=None) -> str:
         start_time = time.time()
         try:
             client = _create_genai_client(current_key)
-            response = _call_model_with_timeout(
+            response, used_model = _call_model_with_timeout(
                 client=client,
                 model=MODEL_NAME,
                 contents=contents,
@@ -332,7 +352,9 @@ def generate_with_key_rotation(contents, config=None) -> str:
             )
             raw_draft = extract_clean_text(response)
             draft = sanitize_draft(raw_draft)
-            print(f"[Gemini Node] Successfully generated draft using Key #{idx + 1} with {MODEL_NAME}: '{draft[:60]}...'")
+            if not draft or draft.startswith("Error:") or draft.startswith("⚠️"):
+                raise Exception(f"Model returned invalid draft: {draft}")
+            print(f"[Gemini Node] Successfully generated draft using Key #{idx + 1} with {used_model}: '{draft[:60]}...'")
             return draft
         except Exception as e:
             latency_ms = (time.time() - start_time) * 1000
@@ -360,11 +382,13 @@ def generate_with_key_rotation(contents, config=None) -> str:
                     time.sleep(delay)
                     continue
                 else:
-                    print(f"[Gemini Node] Server high demand backoff retries exhausted ({len(backoff_delays)} attempts on {MODEL_NAME}).")
-                    return f"⚠️ [GEMINI ERROR: {type(e).__name__}: {str(e)[:150]}]"
+                    print(f"[Gemini Node] Server high demand backoff retries exhausted ({len(backoff_delays)} attempts on {MODEL_NAME}). Rotating to next key...")
+                    _active_key_index = next_idx
+                    continue
             else:
-                print(f"[Gemini Node] Model {MODEL_NAME} failed with non-quota error:\n{traceback.format_exc()}")
-                return f"⚠️ [GEMINI ERROR: {type(e).__name__}: {str(e)[:150]}]"
+                print(f"[Gemini Node] Key #{idx + 1} failed ({e}). Rotating to Key #{next_idx + 1}...")
+                _active_key_index = next_idx
+                continue
 
     if len(quota_exhausted_keys) >= total_keys:
         print(f"[Gemini Node] ⚡ All {total_keys} API keys exhausted! Returning in-character rest fallback.")
