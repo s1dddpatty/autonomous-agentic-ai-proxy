@@ -228,12 +228,29 @@ async def toggle_mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         parse_mode="Markdown"
     )
 
+async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Triggers an immediate safe snapshot backup of data/ and sends it to Telegram."""
+    if update.effective_user.id != AUTHORIZED_USER_ID:
+        return
+
+    from src.core.backup_manager import send_telegram_backup
+
+    await update.message.reply_text("📦 Creating safe snapshot of chats, memory & checkpoints...")
+    ok, summary = await asyncio.to_thread(send_telegram_backup, "Manual Backup")
+    prefix = "✅" if ok else "⚠️"
+    await update.message.reply_text(f"{prefix} {summary}")
+
 def main():
+    from src.core.backup_manager import start_backup_scheduler
+
+    start_backup_scheduler()
+
     application = Application.builder().token(TOKEN).build()
     
     application.add_handler(CommandHandler("toggle_mode", toggle_mode_command))
     application.add_handler(CommandHandler("mode", toggle_mode_command))
     application.add_handler(CommandHandler("simulate", simulate_command))
+    application.add_handler(CommandHandler("backup", backup_command))
     application.add_handler(CallbackQueryHandler(button_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     

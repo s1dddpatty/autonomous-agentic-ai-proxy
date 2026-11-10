@@ -3,6 +3,7 @@
 
 # Data & Persistence
 data/
+backups/
 *.db
 *.sqlite3
 *.sqlite*
