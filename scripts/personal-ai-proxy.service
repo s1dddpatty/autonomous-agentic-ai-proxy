@@ -1,0 +1,16 @@
+[Unit]
+Description=Autonomous Personal AI WhatsApp Proxy (FastAPI + Telegram + Ngrok)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/personal-ai-proxy
+ExecStart=/home/ubuntu/personal-ai-proxy/venv/bin/python -u /home/ubuntu/personal-ai-proxy/run_webhook.py
+Restart=always
+RestartSec=5
+Environment="PYTHONUNBUFFERED=1"
+
+[Install]
+WantedBy=multi-user.target
