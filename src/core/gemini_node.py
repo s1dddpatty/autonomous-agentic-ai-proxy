@@ -14,7 +14,7 @@ from google.genai import types
 
 from src.core.config import GEMINI_KEYS, ENABLE_KEY_ROTATION, TARGET_NAME, TARGET_PHONE
 GEMINI_API_KEYS = GEMINI_KEYS
-from src.core.memory_manager import get_recent_feedback, get_recent_history
+from src.core.memory_manager import get_recent_feedback, get_recent_history, get_recent_cards
 from src.core.vector_memory import retrieve_dual_context, retrieve_relevant_facts
 from src.core.metrics import log_api_usage
 
@@ -595,6 +595,25 @@ CRITICAL OUTPUT RULE: Never output your internal checklist, bullet points (* or 
             f"(These facts are 100% accurate. If she is asking about a past milestone or date, state the exact fact/date from here naturally.)"
         )
 
+    # 7. Card & Dispatch Memory (Anti-Repetition Brain)
+    recent_cards = get_recent_cards(sender_id=state.get("sender_id", ""), minutes=30, limit=5)
+    recent_cards_block = ""
+    if recent_cards:
+        card_entries = []
+        for c in recent_cards:
+            status_tag = "ALREADY SENT" if c.get("status") == "approved" else "PENDING APPROVAL ON TELEGRAM"
+            card_entries.append(
+                f"- [{status_tag}] Her msg: \"{c.get('incoming_text', '')[:120]}\" -> Your drafted/sent reply: \"{c.get('draft_text', '')}\""
+            )
+        recent_cards_str = "\n".join(card_entries)
+        recent_cards_block = f"\n<RECENTLY_DRAFTED_OR_SENT_CARDS>\n{recent_cards_str}\n</RECENTLY_DRAFTED_OR_SENT_CARDS>\n"
+        system_instruction += (
+            "\n\nANTI-REPETITION & CARD MEMORY RULE (CRITICAL):\n"
+            "- Look carefully at <RECENTLY_DRAFTED_OR_SENT_CARDS> in the input. Those replies were ALREADY dispatched or are already queued in Telegram.\n"
+            "- NEVER repeat the full Goodnight ritual, same phrases, or exact replies you already drafted or sent in a recent card!\n"
+            "- If she sent follow-up closing lines (e.g., extra goodnight/sweet dreams/love you texts) after you ALREADY drafted the Goodnight ritual in an earlier card, DO NOT repeat the 7-line Goodnight sequence again—reply ONLY briefly and warmly to any new sentiment she added (e.g., 'Love you moreee ❤️' or 'Haan bilkul ache se so jaunga 😌✨')."
+        )
+
     LIVE_INPUT = f"""<TOP_10_SITUATIONAL_STYLE_BURSTS>
 {style_chunks}
 </TOP_10_SITUATIONAL_STYLE_BURSTS>
@@ -602,7 +621,7 @@ CRITICAL OUTPUT RULE: Never output your internal checklist, bullet points (* or 
 <RECALLED_EPISODIC_MEMORIES>
 {memory_chunks}
 </RECALLED_EPISODIC_MEMORIES>
-
+{recent_cards_block}
 Recent Chat History (Last 20 messages):
 {history_str}
 

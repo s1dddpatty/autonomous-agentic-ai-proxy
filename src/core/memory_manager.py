@@ -403,5 +403,55 @@ def get_latest_pending_card():
         "status": row[5]
     }
 
+def get_recent_cards(sender_id: str = "", minutes: int = 30, limit: int = 5) -> list[dict]:
+    """
+    Returns recent pending/approved Telegram cards within the last `minutes`
+    in chronological order so the generator avoids repeating already-drafted replies.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    modifier = f"-{max(1, int(minutes))} minutes"
+    if sender_id:
+        cursor.execute(
+            '''
+            SELECT telegram_message_id, thread_id, sender_id, incoming_text, draft_text, status, updated_at
+            FROM pending_cards
+            WHERE status IN ('pending', 'approved')
+              AND sender_id = ?
+              AND updated_at >= datetime('now', ?)
+            ORDER BY telegram_message_id DESC
+            LIMIT ?
+            ''',
+            (str(sender_id), modifier, limit),
+        )
+    else:
+        cursor.execute(
+            '''
+            SELECT telegram_message_id, thread_id, sender_id, incoming_text, draft_text, status, updated_at
+            FROM pending_cards
+            WHERE status IN ('pending', 'approved')
+              AND updated_at >= datetime('now', ?)
+            ORDER BY telegram_message_id DESC
+            LIMIT ?
+            ''',
+            (modifier, limit),
+        )
+    rows = cursor.fetchall()
+    conn.close()
+
+    cards = [
+        {
+            "telegram_message_id": r[0],
+            "thread_id": r[1],
+            "sender_id": r[2],
+            "incoming_text": r[3],
+            "draft_text": r[4],
+            "status": r[5],
+            "updated_at": r[6],
+        }
+        for r in rows
+    ]
+    return list(reversed(cards))
+
 # Ensure DB is created on import
 setup_db()

@@ -1,5 +1,6 @@
 import os
 import asyncio
+from collections import deque
 from typing import Dict, List
 from fastapi import FastAPI, Request, Query, BackgroundTasks
 from fastapi.responses import PlainTextResponse
@@ -17,6 +18,8 @@ app = FastAPI()
 # -------------------------------------------------------------
 DEBOUNCE_SECONDS = float(os.getenv("DEBOUNCE_SECONDS", "7.0"))
 ACTIVE_TIMERS: Dict[str, asyncio.Task] = {}
+SEEN_MESSAGE_IDS = deque(maxlen=500)
+SEEN_MESSAGE_SET = set()
 
 async def debounce_and_dispatch(chat_id: str):
     """
@@ -84,6 +87,17 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                 # Skip read/delivery status updates (they contain "statuses" instead of "messages")
                 if "messages" in value:
                     for message in value.get("messages", []):
+                        msg_id = message.get("id")
+                        if msg_id:
+                            if msg_id in SEEN_MESSAGE_SET:
+                                print(f"[Webhook Dedupe] Ignoring duplicate Meta webhook message id={msg_id}")
+                                continue
+                            if len(SEEN_MESSAGE_IDS) == SEEN_MESSAGE_IDS.maxlen:
+                                evicted = SEEN_MESSAGE_IDS.popleft()
+                                SEEN_MESSAGE_SET.discard(evicted)
+                            SEEN_MESSAGE_IDS.append(msg_id)
+                            SEEN_MESSAGE_SET.add(msg_id)
+
                         sender_id = message.get("from")
                         
                         if message.get("type") == "text":
