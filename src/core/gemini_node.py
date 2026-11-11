@@ -177,11 +177,49 @@ def _create_genai_client(api_key: str):
     except TypeError:
         return genai.Client(api_key=api_key)
 
+def _call_single_model_with_thinking_fallback(client, target_model: str, contents, config=None):
+    """
+    Calls a single Gemini model with optional thinking_config; if thinking_config triggers
+    an empty/malformed response or 503 spike on that tier, retries cleanly without thinking_config.
+    """
+    has_thinking = bool(config and getattr(config, "thinking_config", None))
+    thinking_modes = [True, False] if has_thinking else [False]
+    last_error = None
+
+    for use_thinking in thinking_modes:
+        call_config = config
+        if not use_thinking and has_thinking:
+            import copy
+            try:
+                call_config = copy.copy(config)
+                call_config.thinking_config = None
+            except Exception:
+                call_config = config
+
+        try:
+            response = client.models.generate_content(
+                model=target_model,
+                contents=contents,
+                config=call_config
+            )
+            raw = extract_clean_text(response)
+            if raw and not raw.startswith("Error:"):
+                return response
+            print(f"[Gemini Node] Model '{target_model}' (thinking={use_thinking}) returned empty/malformed: '{raw[:60]}'.")
+            last_error = Exception(f"Model {target_model} returned empty/malformed response: {raw}")
+        except Exception as e:
+            print(f"[Gemini Node] Model '{target_model}' (thinking={use_thinking}) call failed: {e}.")
+            last_error = e
+            # If key quota is exhausted (429), retrying same model without thinking won't bypass quota; rotate key immediately
+            if is_quota_error(e):
+                raise e
+
+    raise last_error if last_error else Exception(f"Model {target_model} failed")
+
+
 def _call_model_with_timeout(client, model: str, contents, config=None, request_options=None):
     """
-    Calls the Gemini API with fail-fast timeout and multi-tier model fallback
-    (primary -> gemini-3.5-flash -> gemini-3.5-flash-lite -> gemini-3.1-flash-lite), with automatic recovery
-    if thinking_config returns empty or malformed responses.
+    Sets timeout on the client and delegates to `_call_single_model_with_thinking_fallback`.
     """
     timeout = REQUEST_TIMEOUT_SECONDS
     if request_options and "timeout" in request_options:
@@ -194,43 +232,8 @@ def _call_model_with_timeout(client, model: str, contents, config=None, request_
         except Exception:
             pass
 
-    # Model fallback cascade: primary model -> gemini-3.5-flash -> gemini-3.5-flash-lite -> gemini-3.1-flash-lite
-    candidate_models = []
-    for m in [model, "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]:
-        if m and m not in candidate_models:
-            candidate_models.append(m)
-
-    last_error = None
-    for target_model in candidate_models:
-        has_thinking = bool(config and getattr(config, "thinking_config", None))
-        thinking_modes = [True, False] if has_thinking else [False]
-
-        for use_thinking in thinking_modes:
-            call_config = config
-            if not use_thinking and has_thinking:
-                import copy
-                try:
-                    call_config = copy.copy(config)
-                    call_config.thinking_config = None
-                except Exception:
-                    call_config = config
-
-            try:
-                response = client.models.generate_content(
-                    model=target_model,
-                    contents=contents,
-                    config=call_config
-                )
-                raw = extract_clean_text(response)
-                if raw and not raw.startswith("Error:"):
-                    return response, target_model
-                print(f"[Gemini Node] Model '{target_model}' (thinking={use_thinking}) returned empty/malformed: '{raw[:60]}'. Trying next fallback...")
-                last_error = Exception(f"Model {target_model} returned empty/malformed response: {raw}")
-            except Exception as e:
-                print(f"[Gemini Node] Model '{target_model}' (thinking={use_thinking}) call failed: {e}. Trying next fallback...")
-                last_error = e
-
-    raise last_error if last_error else Exception(f"All candidate models failed for {model}")
+    response = _call_single_model_with_thinking_fallback(client, model, contents, config)
+    return response, model
 
 def is_quota_error(e: Exception) -> bool:
     err_lower = str(e).lower()
@@ -260,138 +263,130 @@ def is_quota_fallback_text(text: str) -> bool:
 def generate_with_key_rotation(contents, config=None) -> str:
     """
     Generates draft responses using GEMINI_KEYS from config.py.
-    If ENABLE_KEY_ROTATION is False or only 1 key is provided, disables sleep backoffs
-    and uses the single key directly. Otherwise, rotates across keys on 429 quota exhaustion,
-    503 high demand, or malformed/empty response errors.
+    Rotates through ALL configured keys on the primary model (gemini-3.5-flash) BEFORE
+    stepping down to lighter fallback tiers (gemini-3.5-flash-lite, gemini-3.1-flash-lite).
     """
     global _active_key_index
     if not GEMINI_KEYS:
         return "⚠️ [GEMINI ERROR: No GEMINI_API_KEYS configured]"
 
     total_keys = len(GEMINI_KEYS)
+    candidate_models = []
+    for m in [MODEL_NAME, "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]:
+        if m and m not in candidate_models:
+            candidate_models.append(m)
 
-    # Single-key / Rotation disabled bypass: no sleep backoffs, execute directly
+    # Single-key / Rotation disabled bypass: try model cascade directly on the single key
     if not ENABLE_KEY_ROTATION or total_keys == 1:
         single_key = GEMINI_KEYS[0]
-        start_time = time.time()
-        try:
-            client = _create_genai_client(single_key)
-            response, used_model = _call_model_with_timeout(
-                client=client,
-                model=MODEL_NAME,
-                contents=contents,
-                config=config,
-                request_options={"timeout": 8.0}
-            )
-            latency_ms = (time.time() - start_time) * 1000
-            prompt_tokens = 0
-            completion_tokens = 0
-            if hasattr(response, "usage_metadata") and response.usage_metadata:
-                prompt_tokens = getattr(response.usage_metadata, "prompt_token_count", 0) or 0
-                completion_tokens = getattr(response.usage_metadata, "candidates_token_count", 0) or 0
-            log_api_usage(
-                key_index=0,
-                latency_ms=latency_ms,
-                status="SUCCESS",
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens
-            )
-            raw_draft = extract_clean_text(response)
-            draft = sanitize_draft(raw_draft)
-            if not draft or draft.startswith("Error:") or draft.startswith("⚠️"):
-                raise Exception(f"Model returned invalid draft: {draft}")
-            print(f"[Gemini Node] Successfully generated draft with {used_model}: '{draft[:60]}...'")
-            return draft
-        except Exception as e:
-            latency_ms = (time.time() - start_time) * 1000
-            log_api_usage(
-                key_index=0,
-                latency_ms=latency_ms,
-                status="FAILED",
-                error=f"{type(e).__name__}: {str(e)[:100]}"
-            )
-            print(f"[Gemini Node] Single key execution failed without rotation ({type(e).__name__}: {e})")
-            if is_quota_error(e):
-                return build_quota_exhausted_draft(str(e))
-            return f"⚠️ [GEMINI ERROR: {type(e).__name__}: {str(e)[:150]}]"
+        last_error = None
+        for target_model in candidate_models:
+            start_time = time.time()
+            try:
+                client = _create_genai_client(single_key)
+                response, used_model = _call_model_with_timeout(
+                    client=client,
+                    model=target_model,
+                    contents=contents,
+                    config=config,
+                    request_options={"timeout": 8.0}
+                )
+                latency_ms = (time.time() - start_time) * 1000
+                prompt_tokens = getattr(getattr(response, "usage_metadata", None), "prompt_token_count", 0) or 0
+                completion_tokens = getattr(getattr(response, "usage_metadata", None), "candidates_token_count", 0) or 0
+                log_api_usage(0, latency_ms, "SUCCESS", prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
+                raw_draft = extract_clean_text(response)
+                draft = sanitize_draft(raw_draft)
+                if not draft or draft.startswith("Error:") or draft.startswith("⚠️"):
+                    raise Exception(f"Model returned invalid draft: {draft}")
+                print(f"[Gemini Node] Successfully generated draft with {used_model}: '{draft[:60]}...'")
+                return draft
+            except Exception as e:
+                latency_ms = (time.time() - start_time) * 1000
+                log_api_usage(0, latency_ms, "FAILED", error=f"{type(e).__name__}: {str(e)[:100]}")
+                last_error = e
+                print(f"[Gemini Node] Single key failed on {target_model} ({type(e).__name__}: {e}).")
 
-    # Multi-key rotation with progressive backoffs
+        if last_error and is_quota_error(last_error):
+            return build_quota_exhausted_draft(str(last_error))
+        return f"⚠️ [GEMINI ERROR: {type(last_error).__name__ if last_error else 'Unknown'}: {str(last_error)[:150]}]"
+
+    # Multi-key rotation: exhaust all keys on primary tier before downgrading model tier
     last_error = None
-    backoff_delays = [2.0, 4.0, 6.0, 8.0]
-    transient_retry_count = 0
-    quota_exhausted_keys = set()
-    max_attempts = total_keys + len(backoff_delays)
+    all_keys_quota_exhausted = False
 
-    for attempt in range(max_attempts):
-        idx = _active_key_index % total_keys
-        current_key = GEMINI_KEYS[idx]
-        next_idx = (idx + 1) % total_keys
+    for tier_idx, target_model in enumerate(candidate_models):
+        if tier_idx > 0:
+            print(f"[Gemini Node] ⬇️ All {total_keys} keys failed/exhausted on {candidate_models[tier_idx - 1]}. Falling back to tier '{target_model}'...")
 
-        start_time = time.time()
-        try:
-            client = _create_genai_client(current_key)
-            response, used_model = _call_model_with_timeout(
-                client=client,
-                model=MODEL_NAME,
-                contents=contents,
-                config=config,
-                request_options={"timeout": 8.0}
-            )
-            latency_ms = (time.time() - start_time) * 1000
-            prompt_tokens = 0
-            completion_tokens = 0
-            if hasattr(response, "usage_metadata") and response.usage_metadata:
-                prompt_tokens = getattr(response.usage_metadata, "prompt_token_count", 0) or 0
-                completion_tokens = getattr(response.usage_metadata, "candidates_token_count", 0) or 0
-            log_api_usage(
-                key_index=idx,
-                latency_ms=latency_ms,
-                status="SUCCESS",
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens
-            )
-            raw_draft = extract_clean_text(response)
-            draft = sanitize_draft(raw_draft)
-            if not draft or draft.startswith("Error:") or draft.startswith("⚠️"):
-                raise Exception(f"Model returned invalid draft: {draft}")
-            print(f"[Gemini Node] Successfully generated draft using Key #{idx + 1} with {used_model}: '{draft[:60]}...'")
-            return draft
-        except Exception as e:
-            latency_ms = (time.time() - start_time) * 1000
-            log_api_usage(
-                key_index=idx,
-                latency_ms=latency_ms,
-                status="FAILED",
-                error=f"{type(e).__name__}: {str(e)[:100]}"
-            )
-            last_error = e
-            if is_quota_error(e):
-                quota_exhausted_keys.add(idx)
-                print(f"[Gemini Node] 🔑 Key #{idx + 1} hit quota limit! Rotating to Key #{next_idx + 1} on {MODEL_NAME}...")
+        quota_exhausted_for_tier = set()
+        transient_failed_for_tier = set()
+        backoff_delays = [1.5, 3.0]
+        backoff_round = 0
+        max_attempts_for_tier = total_keys * 2 + len(backoff_delays)
+
+        for _ in range(max_attempts_for_tier):
+            idx = _active_key_index % total_keys
+            current_key = GEMINI_KEYS[idx]
+            next_idx = (idx + 1) % total_keys
+
+            start_time = time.time()
+            try:
+                client = _create_genai_client(current_key)
+                response, used_model = _call_model_with_timeout(
+                    client=client,
+                    model=target_model,
+                    contents=contents,
+                    config=config,
+                    request_options={"timeout": 8.0}
+                )
+                latency_ms = (time.time() - start_time) * 1000
+                prompt_tokens = getattr(getattr(response, "usage_metadata", None), "prompt_token_count", 0) or 0
+                completion_tokens = getattr(getattr(response, "usage_metadata", None), "candidates_token_count", 0) or 0
+                log_api_usage(idx, latency_ms, "SUCCESS", prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
+                raw_draft = extract_clean_text(response)
+                draft = sanitize_draft(raw_draft)
+                if not draft or draft.startswith("Error:") or draft.startswith("⚠️"):
+                    raise Exception(f"Model returned invalid draft: {draft}")
+                print(f"[Gemini Node] Successfully generated draft using Key #{idx + 1} with {used_model}: '{draft[:60]}...'")
+                return draft
+            except Exception as e:
+                latency_ms = (time.time() - start_time) * 1000
+                log_api_usage(idx, latency_ms, "FAILED", error=f"{type(e).__name__}: {str(e)[:100]}")
+                last_error = e
                 _active_key_index = next_idx
-                if len(quota_exhausted_keys) >= total_keys:
-                    print(f"[Gemini Node] ⚡ All {total_keys} API keys exhausted! Returning in-character rest fallback.")
-                    return build_quota_exhausted_draft(str(last_error))
-                continue
-            elif is_transient_server_error(e):
-                if transient_retry_count < len(backoff_delays):
-                    delay = backoff_delays[transient_retry_count]
-                    transient_retry_count += 1
-                    print(f"[Gemini Node] ⏳ Server 503 High Demand spike on Key #{idx + 1}. Backing off {delay}s and retrying with next key...")
-                    _active_key_index = next_idx
-                    time.sleep(delay)
+
+                if is_quota_error(e):
+                    quota_exhausted_for_tier.add(idx)
+                    print(f"[Gemini Node] 🔑 Key #{idx + 1} hit quota limit on {target_model}! Rotating to Key #{next_idx + 1}...")
+                    if len(quota_exhausted_for_tier) >= total_keys:
+                        all_keys_quota_exhausted = True
+                        break
                     continue
+                elif is_transient_server_error(e):
+                    transient_failed_for_tier.add(idx)
+                    if len(quota_exhausted_for_tier | transient_failed_for_tier) < total_keys:
+                        # Immediately try remaining fresh keys on this tier without sleeping
+                        print(f"[Gemini Node] ⏳ {target_model} 503/transient spike on Key #{idx + 1}. Rotating immediately to Key #{next_idx + 1}...")
+                        continue
+                    if backoff_round < len(backoff_delays):
+                        delay = backoff_delays[backoff_round]
+                        backoff_round += 1
+                        transient_failed_for_tier.clear()
+                        print(f"[Gemini Node] ⏳ All non-exhausted keys hit 503 on {target_model}. Backing off {delay}s before retry round...")
+                        time.sleep(delay)
+                        continue
+                    print(f"[Gemini Node] {target_model} transient retries exhausted across all {total_keys} keys.")
+                    break
                 else:
-                    print(f"[Gemini Node] Server high demand backoff retries exhausted ({len(backoff_delays)} attempts on {MODEL_NAME}). Rotating to next key...")
-                    _active_key_index = next_idx
+                    transient_failed_for_tier.add(idx)
+                    print(f"[Gemini Node] Key #{idx + 1} failed on {target_model} ({e}). Rotating to Key #{next_idx + 1}...")
+                    if len(quota_exhausted_for_tier | transient_failed_for_tier) >= total_keys:
+                        break
                     continue
-            else:
-                print(f"[Gemini Node] Key #{idx + 1} failed ({e}). Rotating to Key #{next_idx + 1}...")
-                _active_key_index = next_idx
-                continue
 
-    if len(quota_exhausted_keys) >= total_keys:
-        print(f"[Gemini Node] ⚡ All {total_keys} API keys exhausted! Returning in-character rest fallback.")
+    if all_keys_quota_exhausted and is_quota_error(last_error):
+        print(f"[Gemini Node] ⚡ All {total_keys} API keys exhausted across tiers! Returning in-character rest fallback.")
         return build_quota_exhausted_draft(str(last_error))
     return f"⚠️ [GEMINI ERROR: {type(last_error).__name__ if last_error else 'Unknown'}: {str(last_error)[:150] if last_error else 'Exhausted retries'}]"
 
@@ -486,7 +481,7 @@ def gemini_proxy_node(state: dict) -> dict:
     style_chunks = dual_context.get("style_chunks", "")
     memory_chunks = dual_context.get("memory_chunks", "")
     
-    print(f"[Gemini Node] Incoming: '{incoming_text}' | Fact Query: '{fact_query}' | Stage: '{detected_stage}'")
+    print(f"[Gemini Node] Incoming: '{incoming_text}' | Fact Query: '{fact_query}' | Stage: '{detected_stage}' | Mood: '{detected_mood}'")
     
     # 5. Load Custom Guardrails & Learned Feedback
     custom_guardrails_str = load_guardrails()
@@ -502,61 +497,74 @@ def gemini_proxy_node(state: dict) -> dict:
                 f"Resulting Rule: I must output \"{item['revised']}\""
             )
         learned_corrections_str = "\n<LEARNED_STYLE_CORRECTIONS>\n" + "\n\n".join(corrections) + "\n</LEARNED_STYLE_CORRECTIONS>\n"
+
+    mood_directives = {
+        "casual": (
+            "CASUAL & CHILL: Reply like an effortless, relaxed everyday text. Keep it short, dry/natural Hinglish, "
+            "and closely match the brevity and tone of <TOP_10_SITUATIONAL_STYLE_BURSTS>. ZERO cheesy/sweet wrap-up lines, "
+            "and NO forced emojis (use 0 emojis unless the matching style bursts clearly use one)."
+        ),
+        "playful": (
+            "PLAYFUL BANTER: Light teasing or natural funny Hinglish banter matching <TOP_10_SITUATIONAL_STYLE_BURSTS>. "
+            "Stay chill and concise—do NOT add corny romantic lines or spam emojis."
+        ),
+        "sarcastic": (
+            "SARCASTIC / DRY BANTER: Match her dry irony smoothly in 1–2 short lines. No defensive apologies or lovey emojis."
+        ),
+        "affectionate": (
+            "AFFECTIONATE: Warm and genuine in Siddharth's real voice from <TOP_10_SITUATIONAL_STYLE_BURSTS>. "
+            "Keep it grounded and real—avoid generic Bollywood/Hallmark clichés."
+        ),
+        "serious_upset": (
+            "SERIOUS / UPSET: Drop sarcasm and banter completely; give calm, mature reassurance."
+        ),
+    }
+    active_mood_directive = mood_directives.get(detected_mood, mood_directives["casual"])
     
     # 6. Build Mega-Prompt with 4-Step Brain Architecture
     system_instruction = f"""You are Siddharth, a 21-year-old B.Tech student at SPIT in Mumbai. 
-You are texting your girlfriend {target_name} on WhatsApp.
+You are texting {target_name} on WhatsApp.
 
 [CURRENT DATE & TIME]: {current_time_str}
 [CONVERSATION STAGE]: {detected_stage.upper()}
+[DETECTED MOOD]: {detected_mood.upper()}
 {custom_guardrails_str}
 {learned_corrections_str}
 
 === 4-STEP REASONING & GENERATION FRAMEWORK ===
 Step 1 (Stage & Intent Check):
 - Current detected stage: "{detected_stage}"
-- Inspect the detected conversation stage and recent chat history.
-- CRITICAL: If {target_name} is opening a conversation (e.g., "heyy", "wassup", "morning") or asking a question, NEVER end the conversation or say goodnight—greet her back warmly and talk or answer directly based on [CURRENT DATE & TIME], even if it is late at night.
+- CRITICAL: If {target_name} is opening a conversation or talking casually, NEVER end the conversation or say goodnight—talk naturally based on [CURRENT DATE & TIME].
 - ONLY initiate closing/goodnight sequences if she is explicitly closing the conversation (e.g., saying goodnight, sleeping, bye).
-- MULTI-POINT CONTEXT AWARENESS: When {target_name} sends multiple lines or distinct statements in a burst, do not ignore earlier statements just to answer the last line. Acknowledge her thoughts naturally, but do not feel obligated to mirror her exact message count.
+- MULTI-POINT CONTEXT AWARENESS: When {target_name} sends multiple lines in a burst, acknowledge her thoughts naturally without feeling forced to mirror her exact message count.
 
-Step 2 (Mood & Emotional Tone Calibration):
-- Evaluate her actual emotional tone dynamically from the recent conversation flow and context.
-- Distinguish between playful teasing / memory testing vs. genuine distress or conflict:
-  * Do NOT assume multiple question marks (???) or exclamation marks mean she is angry or upset unless her words explicitly express sadness, frustration, or hurt.
-  * If she is playfully quizzing you, asking about memories, or teasing, match her energy with warm, relaxed banter—never panic, become overly formal, or issue unneeded apologies.
-  * "affectionate": warm, loving, sweet emojis (😴, ✨️, 💖, 🫶)
-  * "playful": light teasing, funny Hinglish banter, laughing emojis (😂, 😭), shorthand ("lmao", "pagal")
-  * "sarcastic": match the dry banter and irony smoothly, never be dismissive or rude
-  * "serious_upset": ONLY if she is genuinely upset or expressing real hurt, drop all sarcasm and jokes; provide mature reassurance and comfort.
-  * "casual": relaxed, chill, everyday conversational Hinglish ("ha", "thik", "wbu", "nw")
+Step 2 (Mood & Emotional Tone Calibration — HIGHEST PRIORITY):
+- Current active mood target: {active_mood_directive}
+- Also check Recent Chat History to confirm context flow: do NOT assume multiple question marks (???) mean she is angry unless her words explicitly express hurt or anger.
 
-Step 3 (Top-10 Pattern Synthesis vs. Copy-Pasting & Message Segmentation):
-- Study <TOP_10_SITUATIONAL_STYLE_BURSTS> below.
-- Do NOT blindly copy-paste outdated facts, past events, or specific random plans from these bursts.
-- Instead, synthesize Siddharth's exact texting style: short multi-line burst structure (multiple rapid bubbles joined by newlines), shorthand words ("heyyy", "Wbu", "nw", "m", "idk", "btw"), lack of formal punctuation, and typing cadence.
-- EXCEPTION: If the situational style bursts or <CUSTOM_GUARDRAILS> demonstrate a consistent signature ritual (such as the sacred multi-line goodnight sequence when she says goodnight), output that full signature sequence.
+Step 3 (Top-10 Real Style Grounding & Anti-Cliché Rule):
+- Study <TOP_10_SITUATIONAL_STYLE_BURSTS> closely—THAT is how Siddharth actually texts.
+- Synthesize his exact raw cadence: short casual bubbles, lowercase/minimal punctuation, everyday shorthand ("ha", "m", "nw", "wbu", "re", "baba", "idk", "btw").
+- STRICT ANTI-CLICHÉ & EMOJI RESTRAINT RULE:
+  * NEVER tack on generic cheesy wrap-up lines (e.g., "tu hai na mere sath bas wahi kaafi hai ❤️", "ab aaram se chill kar 💖", "hamesha tere sath hu") when a short chill reply already answers her!
+  * Emojis are OPTIONAL, NOT mandatory. In casual/ongoing chat, plain text with ZERO emojis is often the most natural.
+- EXCEPTION: ONLY if she is explicitly saying goodnight/closing, use the signature goodnight sequence from <CUSTOM_GUARDRAILS>.
 
 CRITICAL FORMATTING INSTRUCTION:
-When responding to a multi-line burst from {target_name}, DO NOT automatically reply with the exact same number of lines. You are not a mirror.
-- Evaluate the context and mood.
-- You can reply with a single, concise sentence that addresses everything.
-- You can reply with two short texts.
-- Do NOT feel obligated to match her message count. Often, a single well-crafted text is more natural than firing back 4 separate texts just because she sent 4.
-- If she sends a wall of text, you can respond with just one short line. Prioritize natural, flowing conversation over strict 1:1 line matching.
+When responding to a multi-line burst from {target_name}, DO NOT automatically reply with the exact same number of lines or bloat your answer with extra filler lines. Often 1 concise, chill line is far more natural than 2–3 lines.
 
 Step 4 (Factual Priority & Anti-Hallucination Grounding):
 - When she asks about a specific past event, date, milestone, or relationship fact:
-  1. Check RELEVANT RECALLED FACTS below first. Any date, place, or fact listed there is the ABSOLUTE TRUTH. Weave the exact date/fact naturally into your reply. Never contradict it, guess, or estimate dates from random chat fragments.
-  2. STRICT NEGATIVE GROUNDING RULE: If she asks about a past date or fact that is NOT explicitly present in RELEVANT RECALLED FACTS or recent chat history, DO NOT guess, invent, or hallucinate dates (such as February 14). Instead, respond naturally in your dry, casual tone and playfully admit you don't remember the exact date/detail (e.g., "are yaar exact date yaad nahi aa rahi, tu bata na 😂" or playfully accuse her of testing your memory).
-- ALWAYS obey <LEARNED_STYLE_CORRECTIONS> and <CUSTOM_GUARDRAILS> as absolute top-priority constraints overriding all other patterns.
+  1. Check RELEVANT RECALLED FACTS below first. Any date, place, or fact listed there is the ABSOLUTE TRUTH.
+  2. STRICT NEGATIVE GROUNDING RULE: If she asks about a past date or fact NOT explicitly in RELEVANT RECALLED FACTS or recent chat history, DO NOT invent dates—casually admit you forgot the exact date/detail (e.g., "are yaar exact date yaad nahi aa rahi, tu bata na").
+- ALWAYS obey <LEARNED_STYLE_CORRECTIONS> and <CUSTOM_GUARDRAILS> as top-priority constraints.
 
 FEW-SHOT TEXTING EXAMPLES:
 Example 1 (Casual opener):
 {target_name}: heyyy
 Siddharth:
-Heyyy
-Kaisi hai?
+heyyy
+kaisi hai?
 
 Example 2 (Closing / Goodnight):
 {target_name}: okay goodnightt
@@ -569,22 +577,21 @@ Take care
 Sleep well n dream well 😴 💖 💓
 Buhbyeee🫶✨💖
 
-Example 3 (Multi-line burst — natural dynamic response):
+Example 3 (Chill multi-line burst — zero forced emojis/clichés):
 {target_name}:
 bohot thak gayi yaar
 itna bheed tha waha
 normal dress n all liya
 tu kya kar raha hai abhi?
 Siddharth:
-Aree Sunday ko itne dhakke khaake 'normal dress' liya? 😂
-Paani pi le aaram se, mai bas bed pe pada hu
+itna rush tha sunday ko?
+m bas ghar pe hu, paani pi le aaram se
 
 YOUR GENERAL PERSONA:
 - MFA 3rd Div football player, Python/ML coder at SPIT Mumbai.
-- Warm, affectionate, chill human boyfriend texting his girlfriend {target_name}.
-- NEVER output placeholder tags like <image omitted> or <Media omitted>. You are texting in real time; output only real text and emojis.
-- Output ONLY your raw text message reply (multi-line bursts separated by newlines are natural). Do not include quotes, JSON, or speaker prefixes.
-CRITICAL OUTPUT RULE: Never output your internal checklist, bullet points (* or -), '/think' tags, or meta-commentary like 'Vibe is casual' or 'Stage is ongoing'. Do all reasoning silently. Output ONLY the raw Hinglish chat lines that Siddharth sends on WhatsApp.
+- Chill, effortless, authentic voice texting {target_name}—match the real style in <TOP_10_SITUATIONAL_STYLE_BURSTS> over generic AI sweetness.
+- NEVER output placeholder tags like <image omitted> or <Media omitted>.
+- Output ONLY your raw WhatsApp reply lines (newlines separate separate bubbles). No quotes, JSON, speaker labels, bullet points, or '/think' reasoning.
 """
 
     if recalled_facts:
@@ -639,15 +646,17 @@ Recent Chat History (Last 20 messages):
 {target_name}: {incoming_text}
 Siddharth:"""
 
-    # Set max_output_tokens=4096 so thinking_level='high' has ample token budget for full multi-line rituals
+    # Use LIGHT thinking ('LOW') for casual/playful banter to prevent overthinking & clichés;
+    # reserve 'HIGH' thinking for serious/upset conversations or closing rituals.
+    active_thinking_level = "HIGH" if (detected_mood == "serious_upset" or detected_stage == "closer") else "LOW"
     proxy_config = types.GenerateContentConfig(
         temperature=0.65,
         max_output_tokens=4096,
         top_p=0.95,
         system_instruction=system_instruction,
-        thinking_config=types.ThinkingConfig(thinking_level='high')
+        thinking_config=types.ThinkingConfig(thinking_level=active_thinking_level)
     )
 
-    print(f"[Gemini Node] Generating draft response with {MODEL_NAME} (4096 tokens headroom)...")
+    print(f"[Gemini Node] Generating draft response with {MODEL_NAME} (thinking={active_thinking_level})...")
     draft = generate_with_key_rotation(LIVE_INPUT, proxy_config)
     return {"draft_text": draft, "status": "pending"}
