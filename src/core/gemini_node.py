@@ -595,10 +595,12 @@ CRITICAL OUTPUT RULE: Never output your internal checklist, bullet points (* or 
             f"(These facts are 100% accurate. If she is asking about a past milestone or date, state the exact fact/date from here naturally.)"
         )
 
-    # 7. Card & Dispatch Memory (Anti-Repetition Brain)
+    # 7. Card & Dispatch Memory (Semantic Anti-Repetition Brain)
     recent_cards = get_recent_cards(sender_id=state.get("sender_id", ""), minutes=30, limit=5)
     recent_cards_block = ""
+    anti_repeat_reminder = ""
     if recent_cards:
+        print(f"[Gemini Node] Anti-repetition brain loaded {len(recent_cards)} recent card(s) from the last 30m.")
         card_entries = []
         for c in recent_cards:
             status_tag = "ALREADY SENT" if c.get("status") == "approved" else "PENDING APPROVAL ON TELEGRAM"
@@ -607,11 +609,19 @@ CRITICAL OUTPUT RULE: Never output your internal checklist, bullet points (* or 
             )
         recent_cards_str = "\n".join(card_entries)
         recent_cards_block = f"\n<RECENTLY_DRAFTED_OR_SENT_CARDS>\n{recent_cards_str}\n</RECENTLY_DRAFTED_OR_SENT_CARDS>\n"
+        anti_repeat_reminder = (
+            "(IMPORTANT: Do NOT re-answer her earlier messages or repeat ANY line, activity, or meaning "
+            "already covered in <RECENTLY_DRAFTED_OR_SENT_CARDS> or Recent Chat History above. Reply ONLY to what is NEW below.)\n"
+        )
         system_instruction += (
-            "\n\nANTI-REPETITION & CARD MEMORY RULE (CRITICAL):\n"
-            "- Look carefully at <RECENTLY_DRAFTED_OR_SENT_CARDS> in the input. Those replies were ALREADY dispatched or are already queued in Telegram.\n"
-            "- NEVER repeat the full Goodnight ritual, same phrases, or exact replies you already drafted or sent in a recent card!\n"
-            "- If she sent follow-up closing lines (e.g., extra goodnight/sweet dreams/love you texts) after you ALREADY drafted the Goodnight ritual in an earlier card, DO NOT repeat the 7-line Goodnight sequence again—reply ONLY briefly and warmly to any new sentiment she added (e.g., 'Love you moreee ❤️' or 'Haan bilkul ache se so jaunga 😌✨')."
+            "\n\nANTI-REPETITION & SEMANTIC DEDUPLICATION RULE (CRITICAL):\n"
+            "- Carefully inspect <RECENTLY_DRAFTED_OR_SENT_CARDS> and Recent Chat History before writing your reply.\n"
+            "- Every draft listed in <RECENTLY_DRAFTED_OR_SENT_CARDS> (whether PENDING APPROVAL ON TELEGRAM or ALREADY SENT) means you have ALREADY handled that point.\n"
+            "- NEVER say the same thing OR convey the same meaning twice across back-to-back cards—even using different Hinglish words!\n"
+            "  * Example 1: If a recent card already said what you're doing (e.g., 'bed pe chill karrau', 'tera hi wait kar raha tha', 'YouTube scroll kar raha hu'), DO NOT say 'mai bas bed pe chill kar raha hu' or state your activity again in the next card.\n"
+            "  * Example 2: If a recent card already asked a check-in question (e.g., 'safe pahunch gayi na ghar?', 'change vagera kar liya?', 'khana khaya?'), DO NOT ask that same question again in the next card.\n"
+            "  * Example 3: If a recent card already delivered the full Goodnight ritual, DO NOT repeat the Goodnight sequence again—acknowledge only any new sentiment concisely (e.g., 'Love you moreee ❤️' or 'Haan aaram se so jaunga 😌✨').\n"
+            "- Focus strictly on answering ONLY what is NEW and UNANSWERED in Current Trigger."
         )
 
     LIVE_INPUT = f"""<TOP_10_SITUATIONAL_STYLE_BURSTS>
@@ -625,7 +635,7 @@ CRITICAL OUTPUT RULE: Never output your internal checklist, bullet points (* or 
 Recent Chat History (Last 20 messages):
 {history_str}
 
-Current Trigger:
+{anti_repeat_reminder}Current Trigger:
 {target_name}: {incoming_text}
 Siddharth:"""
 

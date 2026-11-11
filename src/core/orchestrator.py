@@ -550,37 +550,47 @@ app = builder.compile(
 )
 
 # 6. Helper Functions for Integration
+_SENDER_LOCKS_GUARD = threading.Lock()
+_SENDER_LOCKS = {}
+
+def _get_sender_lock(sender_id: str) -> threading.Lock:
+    """Returns a per-sender lock so overlapping bursts from the same user never race past pending_cards."""
+    key = str(sender_id or "default").strip()
+    with _SENDER_LOCKS_GUARD:
+        if key not in _SENDER_LOCKS:
+            _SENDER_LOCKS[key] = threading.Lock()
+        return _SENDER_LOCKS[key]
+
 def handle_incoming_whatsapp_burst(sender_id: str, combined_incoming: str, lines: Optional[list] = None):
     """
     Handles a debounced WhatsApp burst from the target contact.
-    1. Saves each incoming line to SQLite short-term memory in order.
-    2. Does NOT re-append previously carded messages.
-    3. Invokes Gemini proxy node with this fresh burst.
-    4. Delivers an independent Telegram approval card.
+    Serialized per sender so each burst completes generation and saves to pending_cards
+    before the next burst queries card history.
     """
     from src.core.memory_manager import save_message, get_recent_history
-    
-    # 1. Log each incoming message line to short-term memory in order
-    if lines:
-        for line in lines:
-            if line.strip():
-                save_message(TARGET_NAME, line.strip())
-    else:
-        for line in combined_incoming.split("\n"):
-            if line.strip():
-                save_message(TARGET_NAME, line.strip())
-                
-    thread_id = str(uuid.uuid4())[:8]
-    print(f"[Orchestrator] Fresh debounced burst from {sender_id} (thread {thread_id}): '{combined_incoming[:60]}...'")
-    
-    config = {"configurable": {"thread_id": thread_id}}
-    initial_state = {
-        "message_id": thread_id,
-        "sender_id": sender_id,
-        "incoming_text": combined_incoming,
-        "messages": get_recent_history(limit=20)
-    }
-    return app.invoke(initial_state, config)
+
+    with _get_sender_lock(sender_id):
+        # 1. Log each incoming message line to short-term memory in order
+        if lines:
+            for line in lines:
+                if line.strip():
+                    save_message(TARGET_NAME, line.strip())
+        else:
+            for line in combined_incoming.split("\n"):
+                if line.strip():
+                    save_message(TARGET_NAME, line.strip())
+
+        thread_id = str(uuid.uuid4())[:8]
+        print(f"[Orchestrator] Fresh debounced burst from {sender_id} (thread {thread_id}): '{combined_incoming[:60]}...'")
+
+        config = {"configurable": {"thread_id": thread_id}}
+        initial_state = {
+            "message_id": thread_id,
+            "sender_id": sender_id,
+            "incoming_text": combined_incoming,
+            "messages": get_recent_history(limit=20)
+        }
+        return app.invoke(initial_state, config)
 
 def handle_incoming_whatsapp_message(sender_id: str, incoming_text: str):
     """Single-message entry point that processes without re-appending old cards."""
@@ -629,5 +639,9 @@ def resume_message_pipeline(thread_id: str, action: str, feedback: Optional[str]
             update_pending_card_status(target_msg_id, "approved")
         elif action == "discard":
             update_pending_card_status(target_msg_id, "discarded")
+        elif action in ["edit", "revise", "suggest_changes"]:
+            newest = get_pending_card_by_thread(actual_thread_id)
+            if newest and newest["telegram_message_id"] != target_msg_id:
+                update_pending_card_status(target_msg_id, "superseded")
         
     return result

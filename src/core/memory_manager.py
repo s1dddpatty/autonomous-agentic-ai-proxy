@@ -389,7 +389,7 @@ def delete_pending_card(telegram_message_id: int):
 def get_latest_pending_card():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute('SELECT telegram_message_id, thread_id, sender_id, incoming_text, draft_text, status FROM pending_cards WHERE status = "pending" ORDER BY telegram_message_id DESC LIMIT 1')
+    cursor.execute('SELECT telegram_message_id, thread_id, sender_id, incoming_text, draft_text, status FROM pending_cards WHERE status = "pending" ORDER BY updated_at DESC, telegram_message_id DESC LIMIT 1')
     row = cursor.fetchone()
     conn.close()
     if not row:
@@ -405,12 +405,13 @@ def get_latest_pending_card():
 
 def get_recent_cards(sender_id: str = "", minutes: int = 30, limit: int = 5) -> list[dict]:
     """
-    Returns recent pending/approved Telegram cards within the last `minutes`
+    Returns the latest pending/approved Telegram card per thread within the last `minutes`
     in chronological order so the generator avoids repeating already-drafted replies.
     """
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     modifier = f"-{max(1, int(minutes))} minutes"
+    fetch_limit = max(limit * 3, 15)
     if sender_id:
         cursor.execute(
             '''
@@ -422,7 +423,7 @@ def get_recent_cards(sender_id: str = "", minutes: int = 30, limit: int = 5) -> 
             ORDER BY telegram_message_id DESC
             LIMIT ?
             ''',
-            (str(sender_id), modifier, limit),
+            (str(sender_id), modifier, fetch_limit),
         )
     else:
         cursor.execute(
@@ -434,23 +435,31 @@ def get_recent_cards(sender_id: str = "", minutes: int = 30, limit: int = 5) -> 
             ORDER BY telegram_message_id DESC
             LIMIT ?
             ''',
-            (modifier, limit),
+            (modifier, fetch_limit),
         )
     rows = cursor.fetchall()
     conn.close()
 
-    cards = [
-        {
+    # Keep only the most recent card per thread_id so superseded/edited older cards don't clutter context
+    seen_threads = set()
+    cards = []
+    for r in rows:
+        t_id = r[1]
+        if t_id in seen_threads:
+            continue
+        seen_threads.add(t_id)
+        cards.append({
             "telegram_message_id": r[0],
-            "thread_id": r[1],
+            "thread_id": t_id,
             "sender_id": r[2],
             "incoming_text": r[3],
             "draft_text": r[4],
             "status": r[5],
             "updated_at": r[6],
-        }
-        for r in rows
-    ]
+        })
+        if len(cards) >= limit:
+            break
+
     return list(reversed(cards))
 
 # Ensure DB is created on import
