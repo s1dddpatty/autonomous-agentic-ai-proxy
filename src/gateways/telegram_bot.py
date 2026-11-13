@@ -223,8 +223,13 @@ async def toggle_mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     set_config("mode", new_mode)
     
     print(f"[Telegram Bot] 🔄 Persistent mode toggled: {current_mode} -> {new_mode}")
+    mode_desc = (
+        "🚀 Replies send directly to WhatsApp + real-time notification cards appear here."
+        if new_mode == "autopilot"
+        else "🛡️ Requires Telegram card approval before replying to WhatsApp."
+    )
     await update.message.reply_text(
-        f"🔄 Bot is now in *{new_mode.upper()}* mode.",
+        f"🔄 Bot is now in *{new_mode.upper()}* mode.\n_{mode_desc}_",
         parse_mode="Markdown"
     )
 

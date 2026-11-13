@@ -437,6 +437,7 @@ def dispatch_message(state: AgentState):
     sender_id = state.get("sender_id")
     final_draft = state.get("draft_text", "")
     thread_id = state.get("message_id")
+    incoming_text = state.get("incoming_text", "")
     
     # If state draft_text is missing, check pending_cards table by thread_id
     if not final_draft and thread_id:
@@ -448,6 +449,11 @@ def dispatch_message(state: AgentState):
         card = get_pending_card_by_thread(thread_id)
         if card:
             sender_id = card.get("sender_id")
+    # If incoming_text is missing, try retrieving from pending card
+    if not incoming_text and thread_id:
+        card = get_pending_card_by_thread(thread_id)
+        if card:
+            incoming_text = card.get("incoming_text", "")
 
     # CRITICAL SAFETY GUARD: Ensure dynamic recipient number is present
     if not sender_id:
@@ -497,6 +503,37 @@ def dispatch_message(state: AgentState):
                     threading.Thread(target=extract_and_store_facts_sync, daemon=True).start()
         except Exception as e:
             print(f"[Orchestrator] Fact extraction trigger error: {e}")
+
+    # In autopilot mode, deliver an informational read-only notification to Telegram so user can monitor live conversations
+    if mode == "autopilot" and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        try:
+            import requests
+            from src.core.config import get_contact_display_name
+            sender_display = get_contact_display_name(sender_id) if sender_id else "Unknown Contact"
+
+            header = "🚀 [AUTOPILOT DISPATCHED]" if dispatch_success else "⚠️ [AUTOPILOT DISPATCH FAILED - CHECK WHATSAPP]"
+            card_lines = [header, "", f"📩 From: {sender_display}"]
+            if incoming_text and incoming_text.strip():
+                card_lines.append(f'"{incoming_text.strip()}"')
+            card_lines.extend([
+                "",
+                "🤖 Sent AI Reply:",
+                f'"{final_draft.strip()}"'
+            ])
+            autopilot_card_text = "\n".join(card_lines)
+
+            tg_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+            tg_resp = requests.post(
+                tg_url,
+                json={"chat_id": TELEGRAM_CHAT_ID, "text": autopilot_card_text[:4000]},
+                timeout=10
+            )
+            if tg_resp.status_code == 200:
+                print(f"[Orchestrator] 🚀 Autopilot Telegram notification card delivered to chat {TELEGRAM_CHAT_ID}.")
+            else:
+                print(f"[Orchestrator] ⚠️ Autopilot Telegram notification failed: {tg_resp.status_code} - {tg_resp.text}")
+        except Exception as tg_err:
+            print(f"[Orchestrator] ⚠️ Autopilot Telegram notification error: {tg_err}")
     
     return {"status": "dispatched"}
 
@@ -504,7 +541,7 @@ def dispatch_message(state: AgentState):
 def route_after_generation(state: AgentState):
     mode = get_config("mode")
     if mode == "autopilot":
-        print("[Orchestrator] 🚀 Autopilot active: routing directly to dispatch_message (bypassing Telegram)")
+        print("[Orchestrator] 🚀 Autopilot active: routing to dispatch_message (auto-dispatch & notify Telegram)")
         return "dispatch_message"
     return "send_to_telegram"
 
